@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+from .base import BaseOperation, OperationResults
+from ..expressions import to_imgt
+
+import gzip
+import pickle
+import polars as pl
+from pathlib import Path
+from abc import ABC, abstractmethod
+from scipy.spatial.distance import pdist, squareform
+from itertools import combinations
+import numpy as np
+
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ..dataset import TcrDataset
+
+class BaseHlaInferenceOperation(BaseOperation, ABC):
+    name = "base_tcr2hla_inference"
+    version = "0.1"
+    description = "Base operation for TCR2HLA inference - does nothing"
+
+    def __init__(self, model_checkpoint:str|Path="/data/current/projects/hla_models/tcr2hla_info/"):
+        if isinstance(model_checkpoint, str):
+            model_checkpoint = Path(model_checkpoint)
+
+        self.tcrs = self._prepare_tcr_df(model_checkpoint)
+        self.wts = self._prepare_model_wts(model_checkpoint)
+
+    def _prepare_tcr_df(self, model_checkpoint:Path) -> pl.LazyFrame:
+        with gzip.open(model_checkpoint/"models/TRB_weights.pickle.gz", "rb") as f:
+            weights = pickle.load(f)
+
+        dfs = []
+        for hla, wts in weights.items():
+            tcrs, scores = zip(*wts)
+            df = pl.DataFrame({"tcr": tcrs, "score": scores}).with_columns(
+                pl.lit(hla).alias("allele"),
+                pl.lit(hla.split("-")[0]).alias("gene")
+            )
+            dfs.append(df)
+
+        hla_df = pl.concat(dfs).with_columns(
+            junction_aa = pl.col("tcr").str.split("+").list.get(0),
+            v_call = pl.col("tcr").str.split("+").list.get(1),
+            j_call = pl.col("tcr").str.split("+").list.get(2),
+            # score = pl.col("score").abs()
+        ).with_columns(
+            to_imgt(pl.col("v_call")),
+            to_imgt(pl.col("j_call"))
+        ).with_columns(
+            pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
+            pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+        ).drop(["tcr", "v_call", "j_call"]).lazy()
+
+        return hla_df
+    
+    def _prepare_model_wts(self, model_checkpoint:Path) -> pl.LazyFrame:
+
+        with open(model_checkpoint/"models/TRB_models.pickle", "rb") as f:
+            models = pickle.load(f)
+        
+        model_coefs = []
+        for hla, m in models.items():
+            model_coefs.append([hla, m.coef_[0,0], m.coef_[0,1], m.intercept_[0]])
+        model_coefs = pl.DataFrame(model_coefs, schema=["allele", "coef_1", "coef_2", "intercept"], orient="row").lazy()
+        return model_coefs
+
+
+class HlaInference(BaseHlaInferenceOperation, BaseOperation):
+    name = "hla_inference"
+    version = "0.4"
+    description = "Infers HLA types from TCR repertoires using the method from HLA2TCR."
+
+
+    def _run(self, ds:TcrDataset) -> OperationResults:
+
+        tcrs = self.tcrs.with_columns(
+            pl.col("score").abs() # i know this is weird but this also is done in the original code. if not, it can happen that the weighted score is negative and then the logarithm is nan. If it was added just to stop that, the nans should be replaced with 0 instead, but idk.
+        )
+
+        dfs = []
+        for patient_id, df in ds.iter_repertoires_by_patient(progress_bar=True, progress_desc="Inferring HLA for patients"):
+            df = df.filter(
+                pl.col("v_call").str.starts_with("TRB")
+            )
+            n_tcrs = df.select(pl.len()).collect()[0,0]
+            df = df.with_columns(
+                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
+                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+            ).lazy().join(
+                tcrs, on=["v_gene", "j_gene", "junction_aa"], how="inner"
+            ).group_by("allele").agg(
+                pl.sum("duplicate_count").alias("total_duplicate_count"),
+                pl.len().alias("n_unique_hits"),
+                pl.col("score").sum().alias("sum_score"),
+                (pl.col("score")*pl.col("duplicate_count")).sum().add(1).log(10)
+            ).join(
+                self.wts.select("allele"), on="allele", how="right"
+            ) .with_columns(
+                pl.col("score").fill_null(0),
+                pl.col("n_unique_hits").fill_null(0),
+                pl.col("sum_score").fill_null(0),
+                pl.lit(patient_id).alias("patient_id"),
+                pl.lit(n_tcrs).add(1).log(10).alias("log10p_n_tcrs"),
+            )
+
+            dfs.append(df.collect())  
+        
+        res = pl.concat(dfs).join(
+            self.wts.collect(), on="allele", how="left"
+        ).with_columns(
+            model_score = pl.col("score") * pl.col("coef_1") + pl.col("log10p_n_tcrs") * pl.col("coef_2") + pl.col("intercept")
+        ).with_columns(
+            model_prob = 1 / (1 + (-pl.col("model_score")).exp())
+        )
+
+        res_wide = res.sort("allele").pivot(values="model_prob", index="patient_id", on="allele")
+
+        return OperationResults(
+            outputs = {
+                "meta/patient/inferred_hla.parquet": res_wide,
+                "meta/patient/inferred_hla_long.parquet": res
+            }
+        )
+
+
+class RepertoireHlaInference(BaseHlaInferenceOperation, BaseOperation):
+    name = "repertoire_hla_inference"
+    version = "0.2"
+    description = "Infers HLA types from TCR repertoires using the method from HLA2TCR. Does not group by patient"
+
+
+    def _run(self, ds:TcrDataset) -> OperationResults:
+
+        tcrs = self.tcrs.with_columns(
+            pl.col("score").abs() # i know this is weird but this also is done in the original code. if not, it can happen that the weighted score is negative and then the logarithm is nan. If it was added just to stop that, the nans should be replaced with 0 instead, but idk.
+        )
+
+        dfs = []
+        for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Inferring HLA for repertoires"):
+            df = df.filter(
+                pl.col("v_call").str.starts_with("TRB")
+            )
+            n_tcrs = df.select(pl.len()).collect()[0,0]
+            df = df.with_columns(
+                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
+                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+            ).lazy().join(
+                tcrs, on=["v_gene", "j_gene", "junction_aa"], how="inner"
+            ).group_by("allele").agg(
+                pl.sum("duplicate_count").alias("total_duplicate_count"),
+                pl.len().alias("n_unique_hits"),
+                pl.col("score").sum().alias("sum_score"),
+                (pl.col("score")*pl.col("duplicate_count")).sum().add(1).log(10)
+            ).join(
+                self.wts.select("allele"), on="allele", how="right"
+            ) .with_columns(
+                pl.col("score").fill_null(0),
+                pl.col("n_unique_hits").fill_null(0),
+                pl.col("sum_score").fill_null(0),
+                pl.lit(repertoire_id).alias("repertoire_id"),
+                pl.lit(n_tcrs).add(1).log(10).alias("log10p_n_tcrs"),
+            )
+
+            dfs.append(df.collect())  
+        
+        res = pl.concat(dfs).join(
+            self.wts.collect(), on="allele", how="left"
+        ).with_columns(
+            model_score = pl.col("score") * pl.col("coef_1") + pl.col("log10p_n_tcrs") * pl.col("coef_2") + pl.col("intercept")
+        ).with_columns(
+            model_prob = 1 / (1 + (-pl.col("model_score")).exp())
+        )
+
+        res_wide = res.sort("allele").pivot(values="model_prob", index="repertoire_id", on="allele")
+
+        hla_mat = res_wide.drop("repertoire_id").to_numpy()
+        rep_dist = pdist(hla_mat, metric="euclidean")
+        rep_dist_bin = pdist(hla_mat>0.5, metric="hamming")*hla_mat.shape[1]
+        rep_id, rep_id_right = zip(*combinations(res_wide["repertoire_id"], 2))
+
+        rep_dist_df = pl.DataFrame({
+            "repertoire_id": rep_id+rep_id_right,
+            "repertoire_id_right": rep_id_right+rep_id,
+            "hla_dist": np.concatenate([rep_dist, rep_dist]),
+            "hla_dist_binarized": np.concatenate([rep_dist_bin, rep_dist_bin])
+        })
+
+
+        return OperationResults(
+            outputs = {
+                "meta/repertoire/inferred_hla.parquet": res_wide,
+                "meta/repertoire/inferred_hla_long.parquet": res,
+                "meta/repertoire/inferred_hla_distance.parquet": rep_dist_df
+            }
+        )
+    
+
+def get_hla_class_counts(ds:TcrDataset) -> pl.DataFrame:
+
+    h = ds.get_operation_result("repertoire_hla_inference", "long")
+
+    inf = HlaInference()
+
+    hla_summ_long = h.with_columns(
+        pl.col("allele").str.extract(r"^([ABDCQPR]+)\-").alias("gene")
+    ).join(
+        inf.tcrs.group_by("allele").agg(pl.len().alias("n_max")).collect(), on="allele", how="left"
+    ).with_columns(
+        n_unique_hits = pl.col("n_unique_hits"),
+        model_prob_weighted_n_unique_hits = pl.col("model_prob") * pl.col("n_unique_hits"),
+        weighted_capped_n_unique_hits = pl.col("model_prob") * pl.col("n_unique_hits") * pl.col("n_max"),
+        log_dups = pl.col("total_duplicate_count").add(1).log(2)
+    ).group_by(["repertoire_id", "gene"]).agg(
+        pl.sum("n_unique_hits").alias("total_n_unique_hits"),
+        pl.sum("weighted_capped_n_unique_hits").alias("total_weighted_capped_n_unique_hits"),
+        pl.sum("model_prob_weighted_n_unique_hits").alias("total_model_prob_weighted_n_unique_hits"),
+        pl.sum("log_dups").alias("total_duplicate_count")
+    )
+
+    h_count = hla_summ_long.pivot(
+        index="repertoire_id", on="gene", values="total_n_unique_hits"
+    ).select(["repertoire_id", "A", "B", "C", "DP", "DQ", "DR"]).with_columns(
+        class_i_to_ii_ratio = (pl.col("A") + pl.col("B") + pl.col("C")).add(1).log().cast(pl.Float64) - (pl.col("DP") + pl.col("DQ") + pl.col("DR")).add(1).log().cast(pl.Float64),
+        class_i = (pl.col("A") + pl.col("B") + pl.col("C")),
+        class_ii = (pl.col("DP") + pl.col("DQ") + pl.col("DR"))
+    )
+
+    h_wt_count = hla_summ_long.pivot(
+        index="repertoire_id", on="gene", values="total_model_prob_weighted_n_unique_hits"
+    ).select(["repertoire_id", "A", "B", "C", "DP", "DQ", "DR"]).with_columns(
+        class_i_to_ii_ratio = (pl.col("A") + pl.col("B") + pl.col("C")).add(1).log().cast(pl.Float64) - (pl.col("DP") + pl.col("DQ") + pl.col("DR")).add(1).log().cast(pl.Float64),
+        class_i = (pl.col("A") + pl.col("B") + pl.col("C")),
+        class_ii = (pl.col("DP") + pl.col("DQ") + pl.col("DR"))
+    )
+
+    h_wt_capped = hla_summ_long.pivot(
+        index="repertoire_id", on="gene", values="total_weighted_capped_n_unique_hits"
+    ).select(["repertoire_id", "A", "B", "C", "DP", "DQ", "DR"]).with_columns(
+        class_i_to_ii_ratio = (pl.col("A") + pl.col("B") + pl.col("C")).add(1).log().cast(pl.Float64) - (pl.col("DP") + pl.col("DQ") + pl.col("DR")).add(1).log().cast(pl.Float64),
+        class_i = (pl.col("A") + pl.col("B") + pl.col("C")),
+        class_ii = (pl.col("DP") + pl.col("DQ") + pl.col("DR"))
+    )
+
+    # h_duplicates = hla_summ_long.pivot(
+    #     index="repertoire_id", on="gene", values="total_duplicate_count"
+    # ).select(["repertoire_id", "A", "B", "C", "DP", "DQ", "DR"]).with_columns(
+    #     class_i_to_ii_ratio = (pl.col("A") + pl.col("B") + pl.col("C")).add(1).log().cast(pl.Float64) - (pl.col("DP") + pl.col("DQ") + pl.col("DR")).add(1).log().cast(pl.Float64),
+    #     class_i = (pl.col("A") + pl.col("B") + pl.col("C")),
+    #     class_ii = (pl.col("DP") + pl.col("DQ") + pl.col("DR"))
+    # )
+
+    h_counts = h_count.join(h_wt_count, on="repertoire_id", how="left", suffix="_wt").join(h_wt_capped, on="repertoire_id", how="left", suffix="_wt_with_max")
+
+    return h_counts
