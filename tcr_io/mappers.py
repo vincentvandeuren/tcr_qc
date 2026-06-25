@@ -70,6 +70,19 @@ class DictMapper(BaseMapper):
     
     def __repr__(self):
         return f"DictMapper(mapping={self.mapping})"
+
+class ReplacingDictMapper(BaseMapper):
+    def __init__(self, mapping:Dict):
+        self.mapping = mapping
+
+    def _transform(self, key:Union[Path, str]):
+        if isinstance(key, Path):
+            key = key.name
+
+        return self.mapping.get(key, key)
+    
+    def __repr__(self):
+        return f"ReplacingDictMapper(mapping={self.mapping})"
     
 
 class RegexMapper(BaseMapper):
