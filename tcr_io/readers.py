@@ -183,7 +183,7 @@ class AdaptiveReader(BaseReader):
         ("aminoAcid","amino_acid", "cdr3_amino_acid"): "junction_aa",
         ("vMaxResolved", "v_resolved"): "v_call",
         ("jMaxResolved", "j_resolved"): "j_call",
-        ("count (templates/reads)","templates", "seq_reads", "copy"):"duplicate_count",
+        ("count (templates/reads)","templates", "seq_reads", "copy", "count", "count (reads)"):"duplicate_count",
     }
     null_values = ["unknown", "unresolved", "NA", "na"]
     name = "adaptive"
