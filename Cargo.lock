@@ -2483,16 +2483,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-stemmers"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
-dependencies = [
- "serde",
- "serde_derive",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2892,7 +2882,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tcr-io"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "aho-corasick",
  "num-traits",
@@ -2900,7 +2890,6 @@ dependencies = [
  "polars-arrow",
  "pyo3",
  "pyo3-polars",
- "rust-stemmers",
  "serde",
 ]
 

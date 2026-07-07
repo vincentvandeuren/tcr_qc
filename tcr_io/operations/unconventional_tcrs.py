@@ -12,17 +12,13 @@ class BaseHits(BaseOperation, ABC):
     description = "Counts the number of hits for each repertoire."
     result_name_short = "base"
 
-    def __init__(self, model_checkpoint:Optional[str|Path]=None):
+    def __init__(self, model_checkpoint: Optional[str | Path] = None):
         if model_checkpoint is None:
-            model_checkpoint = self.default_model_checkpoint
-        else:
-            model_checkpoint = Path(model_checkpoint)
-        self.query_df = self._prepare_query_df(model_checkpoint)
-
-    @property
-    @abstractmethod
-    def default_model_checkpoint(self) -> Path:
-        pass
+            raise ValueError(
+                f"{type(self).__name__} requires a model file (not bundled in the beta). "
+                "Pass model_checkpoint=<path-to-parquet>. See README 'Beta limitations'."
+            )
+        self.query_df = self._prepare_query_df(Path(model_checkpoint))
 
     @abstractmethod
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
@@ -154,10 +150,6 @@ class MaitHits(BaseHits):
     version = "0.6"
     description = "Counts the number of mait hits (from unconventional tcr db) for each repertoire."
     result_name_short = "mait"
-
-    @property
-    def default_model_checkpoint(self) -> Path:
-        return Path("/data/current/datasets/databases/unconventional_tcrs/data/mait_parsed.parquet")
 
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
         return pl.read_parquet(model_checkpoint).select(["v_gene", "j_gene", "junction_aa"]).lazy()
