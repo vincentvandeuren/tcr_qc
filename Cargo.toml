@@ -14,5 +14,4 @@ serde = { version = "1", features = ["derive"] }
 polars = { version = "0.53.0", features=["dtype-struct"], default-features = false}
 polars-arrow = { version = "0.53.0", default-features = false }
 num-traits = "0.2.19"
-rust-stemmers = "1.2.0"
 aho-corasick = "1.1.4"

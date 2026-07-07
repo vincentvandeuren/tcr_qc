@@ -1,10 +1,6 @@
 #![allow(clippy::unused_unit)]
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
-use num_traits::Signed;
-use polars::prelude::arity::broadcast_binary_elementwise;
-use rust_stemmers::{Algorithm, Stemmer};
-use std::fmt::Write;
 use serde::Deserialize;
 use crate::genes_imgt::{Organism, GENE_ALIASES, IMGT_REF};
 use crate::reference_points::{determine_reference_points};

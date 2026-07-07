@@ -1,4 +1,3 @@
-use std::usize;
 use crate::d_segment::{find_best_d_segment};
 use crate::genes_imgt::{Organism, TcrChain, IMGT_REF};
 
