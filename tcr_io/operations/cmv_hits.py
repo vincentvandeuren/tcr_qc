@@ -1,6 +1,6 @@
 # use cmv ecocluster to determing number of hits in repertoire
 from tcr_io.operations.base import BaseOperation, OperationResults
-from tcr_io.expressions import to_imgt
+from tcr_io._resources import resource_path
 import polars as pl
 from pathlib import Path
 
@@ -9,8 +9,12 @@ class ECOClusterHits(BaseOperation):
     version = "0.2"
     description = "Counts the number of CMV ecocluster hits for each repertoire."
 
-    def __init__(self, model_checkpoint:str|Path="/data/current/datasets/specific/may_2024_ecocluster_cmv/data/CMV_ECOcluster_TCRs.tsv"):
-        self.eco_df = self._prepare_eco_df(model_checkpoint)
+    def __init__(self, model_checkpoint: str | Path | None = None):
+        if model_checkpoint is None:
+            path = resource_path("cmv_ecocluster.parquet")
+        else:
+            path = Path(model_checkpoint)
+        self.eco_df = pl.read_parquet(path).lazy()
 
     def _run(self, ds) -> OperationResults:
         
@@ -48,16 +52,3 @@ class ECOClusterHits(BaseOperation):
         return OperationResults(outputs={
             "meta/repertoire/ecocluster_hits.parquet": eco_matches,
         })
-
-    def _prepare_eco_df(self, model_checkpoint):
-        eco_df = pl.read_csv(model_checkpoint, separator="\t").with_columns(
-            pl.col("tcr").str.extract_groups(r"(?P<junction_aa>[A-Z]+)\+(?P<v_call>[A-Z0-9-]+)\+(?P<j_call>[A-Z0-9-]+)").struct.unnest()
-        ).drop("tcr").with_columns(
-            to_imgt("v_call"),
-            to_imgt("j_call")
-        ).with_columns(
-            pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-            pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
-        ).with_row_index("eco_id").select(["v_gene", "j_gene", "junction_aa", "hla_cocluster", "eco_id"]).lazy()
-
-        return eco_df
