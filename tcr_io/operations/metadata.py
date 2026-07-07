@@ -9,33 +9,6 @@ from typing import Optional, List
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 
-# import pyalex :  can also do abstract
-# pyalex.Works()["doi:10.1126/science.1260668"]["abstract"]
-# to check out:
-# https://api.openalex.org/works?filter=doi:10.1016/j.matt.2022.10.007
-# import requests
-# def get_works(filter_str, per_page=100):
-#     """Fetch works with pagination."""
-#     url = "https://api.openalex.org/works"
-#     params = {
-#         "filter": filter_str,
-#         "per_page": per_page,
-#         "cursor": "*",
-#         "api_key": "2Jm8p6OO4MvFNn0GMqb2b9"
-#     }
-
-#     all_works = []
-#     while True:
-#         response = requests.get(url, params=params).json()
-#         all_works.extend(response["results"])
-
-#         cursor = response["meta"].get("next_cursor")
-#         if not cursor:
-#             break
-#         params["cursor"] = cursor
-
-#     return all_works
-
 # ─── Data Model ───────────────────────────────────────────────────────────────
 
 @dataclass
