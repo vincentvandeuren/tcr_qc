@@ -6,14 +6,14 @@
 
 **Architecture:** Declare runtime dependencies and package metadata in `pyproject.toml`; bundle the HLA + CMV model data as pre-processed parquet under `tcr_io/resources/` (dropping the pickle/TSV loading); populate the public API; and land the minimum fixes that turn the red CI green. The bundled parquets and the converter script (`scripts/build_resources.py`, `model_sources/`) already exist in the working tree from a prior session — this plan commits and consumes them.
 
-**Tech Stack:** Rust (PyO3, pyo3-polars, polars 0.53), Python 3.9+, polars, maturin, pytest, ruff, mypy.
+**Tech Stack:** Rust (PyO3, pyo3-polars, polars 0.53), Python 3.10+, polars, maturin, pytest, ruff, mypy.
 
 **Design spec:** `docs/superpowers/specs/2026-06-30-pip-installable-package-design.md`
 
 ## Global Constraints
 
 - Distribution name `tcrio`; import package `tcr_io`. Do not rename either.
-- Python: `requires-python = ">=3.9"` (Rust build is `abi3-py39`; CI omits 3.8).
+- Python: `requires-python = ">=3.10"`, Rust build `abi3-py310`. 3.10 is the true floor (polars ≥3.10, `match/case`, PEP 604 unions). Tested on 3.10–3.14.
 - Runtime deps use `>=` lower bounds in `pyproject.toml`, **no upper caps except `polars`** — polars is a compiled-plugin ABI boundary and is capped `<2.0` (see Task 3).
 - `requirements.txt` stays the exact-pinned (`==`) dev/CI lockfile — not the source of truth for installs.
 - Everything is a core dependency for now (no `[viz]` split); dev tooling lives in `[project.optional-dependencies].dev`.
@@ -194,7 +194,7 @@ build-backend = "maturin"
 
 [project]
 name = "tcrio"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 description = "Polars-based I/O and QC toolkit for T-cell receptor (TCR) repertoire datasets."
 readme = "README.md"
 keywords = ["TCR", "immunology", "bioinformatics", "polars", "repertoire"]
