@@ -4,16 +4,42 @@ build-backend = "maturin"
 
 [project]
 name = "tcrio"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
+description = "Polars-based I/O and QC toolkit for T-cell receptor (TCR) repertoire datasets."
+readme = "README.md"
+keywords = ["TCR", "immunology", "bioinformatics", "polars", "repertoire"]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+dependencies = [
+  # polars is the compiled-plugin ABI boundary — a runtime polars newer than the
+  # build can fail to load. <2.0 = loose cap; tightest-safe = <1.43 (built minor).
+  "polars>=1.42,<2.0",
+  "numpy>=2.2",
+  "scipy>=1.14",
+  "tqdm>=4.67",
+  "packaging>=24",
+  "natsort>=8.4",
+  "requests>=2.32",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+  "networkx>=3.0",
+  "plotly>=5.0",
+  "colorcet>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["maturin>=1.14", "ruff>=0.15", "pytest>=9.1", "mypy>=2.1"]
+
+[project.urls]
+Repository = "https://github.com/vincentvandeuren/tcr_qc"
 
 [tool.maturin]
 module-name = "tcr_io._internal"
+include = ["tcr_io/resources/*.parquet"]
 
 [[tool.mypy.overrides]]
 module = "polars.utils.udfs"
