@@ -38,8 +38,44 @@ print(ds.get_operation_result("gene_counts_summary"))
 
 ## Dataset layout
 
-See the module docstring in `tcr_io/dataset.py` for the full on-disk structure
-(`processed_repertoires/`, `meta/`, `qc/`, `tabulated/`).
+A dataset is a directory with this on-disk structure:
+
+```
+my_dataset/
+├── processed_repertoires/      # One parquet per repertoire. Atomic unit.
+│   ├── sample_001.parquet      # Standardized schema, repertoire_id column
+│   └── sample_002.parquet
+│
+├── tabulated/                  # Hive-partitioned. Generated, deletable, rebuildable.
+│   ├── v_gene=TRBV7-2/
+│   │   └── j_gene=TRBJ2-1/
+│   │       └── my_dataset.parquet
+│   └── ...
+│
+├── meta/
+│   ├── generation.json         # One row per dataset generation. When, how, source, etc.
+│   ├── operations.json         # One row per operation performed on this dataset.
+│   ├── repertoire/
+│   │   ├── repertoire.parquet       # One row per repertoire. IDs, counts, source files, patient_ids.
+│   │   └── repertoire_meta.parquet  # Optional extra metadata (join on repertoire_id).
+│   ├── patient/
+│   │   ├── patient.parquet           # One row per patient. Aggregated stats.
+│   │   ├── patient_meta.parquet      # Optional extra metadata (join on patient_id).
+│   │   ├── hla.parquet               # Optional. Known HLA typing.
+│   │   └── inferred_hla.parquet      # Optional. Computationally inferred.
+│   └── publication/
+│       ├── publication_ids.json      # DOI(s) / pubmed_id(s) for associated publications.
+│       ├── pdfs/                     # Optional publication PDFs.
+│       └── publication.parquet       # Generated, fetched metadata cached here.
+│
+├── qc/                         # Generated. QC metric tables + plots.
+│   ├── repertoire_stats.parquet
+│   ├── gene_usage.parquet
+│   ├── overlap.parquet
+│   └── repertoire_stats.png
+│
+└── README.md                   # Optional. Auto-generated dataset card.
+```
 
 ## Beta limitations
 
