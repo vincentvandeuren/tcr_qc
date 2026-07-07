@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from .base import BaseOperation, OperationResults
-from ..expressions import to_imgt
+from .._resources import resource_path
 
-import gzip
-import pickle
 import polars as pl
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -22,51 +20,16 @@ class BaseHlaInferenceOperation(BaseOperation, ABC):
     version = "0.1"
     description = "Base operation for TCR2HLA inference - does nothing"
 
-    def __init__(self, model_checkpoint:str|Path="/data/current/projects/hla_models/tcr2hla_info/"):
-        if isinstance(model_checkpoint, str):
-            model_checkpoint = Path(model_checkpoint)
-
-        self.tcrs = self._prepare_tcr_df(model_checkpoint)
-        self.wts = self._prepare_model_wts(model_checkpoint)
-
-    def _prepare_tcr_df(self, model_checkpoint:Path) -> pl.LazyFrame:
-        with gzip.open(model_checkpoint/"models/TRB_weights.pickle.gz", "rb") as f:
-            weights = pickle.load(f)
-
-        dfs = []
-        for hla, wts in weights.items():
-            tcrs, scores = zip(*wts)
-            df = pl.DataFrame({"tcr": tcrs, "score": scores}).with_columns(
-                pl.lit(hla).alias("allele"),
-                pl.lit(hla.split("-")[0]).alias("gene")
-            )
-            dfs.append(df)
-
-        hla_df = pl.concat(dfs).with_columns(
-            junction_aa = pl.col("tcr").str.split("+").list.get(0),
-            v_call = pl.col("tcr").str.split("+").list.get(1),
-            j_call = pl.col("tcr").str.split("+").list.get(2),
-            # score = pl.col("score").abs()
-        ).with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call"))
-        ).with_columns(
-            pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-            pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
-        ).drop(["tcr", "v_call", "j_call"]).lazy()
-
-        return hla_df
-    
-    def _prepare_model_wts(self, model_checkpoint:Path) -> pl.LazyFrame:
-
-        with open(model_checkpoint/"models/TRB_models.pickle", "rb") as f:
-            models = pickle.load(f)
-        
-        model_coefs = []
-        for hla, m in models.items():
-            model_coefs.append([hla, m.coef_[0,0], m.coef_[0,1], m.intercept_[0]])
-        model_coefs = pl.DataFrame(model_coefs, schema=["allele", "coef_1", "coef_2", "intercept"], orient="row").lazy()
-        return model_coefs
+    def __init__(self, model_checkpoint: str | Path | None = None):
+        if model_checkpoint is None:
+            tcrs_path = resource_path("hla_tcrs.parquet")
+            wts_path = resource_path("hla_model_weights.parquet")
+        else:
+            d = Path(model_checkpoint)
+            tcrs_path = d / "hla_tcrs.parquet"
+            wts_path = d / "hla_model_weights.parquet"
+        self.tcrs = pl.read_parquet(tcrs_path).lazy()
+        self.wts = pl.read_parquet(wts_path).lazy()
 
 
 class HlaInference(BaseHlaInferenceOperation, BaseOperation):
