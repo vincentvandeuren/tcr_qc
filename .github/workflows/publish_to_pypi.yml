@@ -36,7 +36,10 @@ jobs:
     strategy:
       matrix:
         target: [x86_64]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # 3.14 supported (abi3-py310 wheel + requires-python >=3.10) but not CI-tested
+        # yet: the pinned dev deps (scipy/numpy) lack 3.14 wheels, so venv builds from
+        # source and hangs. Re-add once those ship 3.14 wheels.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
