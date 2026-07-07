@@ -14,12 +14,12 @@
 
 - Distribution name `tcrio`; import package `tcr_io`. Do not rename either.
 - Python: `requires-python = ">=3.9"` (Rust build is `abi3-py39`; CI omits 3.8).
-- Runtime deps use `>=` lower bounds, **no upper caps**, in `pyproject.toml`.
+- Runtime deps use `>=` lower bounds in `pyproject.toml`, **no upper caps except `polars`** — polars is a compiled-plugin ABI boundary and is capped `<2.0` (see Task 3).
 - `requirements.txt` stays the exact-pinned (`==`) dev/CI lockfile — not the source of truth for installs.
 - Everything is a core dependency for now (no `[viz]` split); dev tooling lives in `[project.optional-dependencies].dev`.
 - Bundled resources are read-only parquet in `tcr_io/resources/`; access them via `importlib.resources`, never a hardcoded `/data/...` path.
-- CI runs with `RUSTFLAGS="-Dwarnings"`, so the Rust crate must compile with **zero** warnings (no unused imports).
-- Version comes from `Cargo.toml` via `dynamic = ["version"]`. Beta uses a pre-release (`0.1.0b1`).
+- The CI `-Dwarnings` gate is **removed** (Option A): the Rust crate is under active development with intentional not-yet-wired-up code, so only unused *imports* are cleaned, not dead functions/structs. `cargo clippy` still runs in `make pre-commit` for local visibility. Already applied (commit `fafa85d`).
+- Version comes from `Cargo.toml` via `dynamic = ["version"]`. Cargo needs SemVer `0.1.0-beta.1`; maturin normalizes it to the PEP 440 wheel version `0.1.0b1`, while Python `__version__` (from `CARGO_PKG_VERSION`) reads the raw `0.1.0-beta.1`.
 - Verify commands assume a venv where the extension is built (`maturin develop`) and dev deps are installed.
 
 ---
@@ -40,7 +40,7 @@
 - `tests/test_smoke.py` (new) — import + version.
 - `tests/test_resources.py` (new) — bundled ops load; MAIT raises.
 - `README.md` — real beta README.
-- `Cargo.toml` version — bump to `0.1.0b1`.
+- `Cargo.toml` version — bump to `0.1.0-beta.1` (SemVer; maturin → wheel `0.1.0b1`).
 
 Already on disk from a prior session (this plan just commits them): `tcr_io/resources/*.parquet`, `scripts/build_resources.py`, `model_sources/README.md`, updated `.gitignore`.
 
@@ -54,7 +54,7 @@ Already on disk from a prior session (this plan just commits them): `tcr_io/reso
 - Modify: `Cargo.toml` (dependencies section)
 
 **Interfaces:**
-- Produces: a compiled `tcr_io._internal` extension (so all later Python imports of `tcr_io.expressions` work), and a clippy-clean crate under `-Dwarnings`.
+- Produces: a compiled `tcr_io._internal` extension (so all later Python imports of `tcr_io.expressions` work), and the crate's unused *imports* removed. (Full clippy-clean is NOT a goal — the `-Dwarnings` CI gate was removed per Option A; see Global Constraints.)
 
 - [ ] **Step 1: Remove the four unused imports in `src/expressions.rs`**
 
@@ -205,7 +205,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-  "polars>=1.42",
+  # polars is the compiled-plugin ABI boundary — a runtime polars newer than the
+  # build can fail to load. <2.0 = loose cap; tightest-safe = <1.43 (built minor).
+  "polars>=1.42,<2.0",
   "numpy>=2.2",
   "scipy>=1.14",
   "tqdm>=4.67",
@@ -735,7 +737,7 @@ version = "0.1.0"
 to:
 
 ```toml
-version = "0.1.0b1"
+version = "0.1.0-beta.1"
 ```
 
 - [ ] **Step 2: Build the wheel**
@@ -749,7 +751,7 @@ Run:
 ```bash
 python3 -m venv /tmp/tcrio-clean
 /tmp/tcrio-clean/bin/pip install --upgrade pip
-/tmp/tcrio-clean/bin/pip install "$(ls -t dist/tcrio-0.1.0b1-*.whl | head -1)"
+/tmp/tcrio-clean/bin/pip install "$(ls -t dist/tcrio-*.whl | head -1)"
 ```
 Expected: pip resolves and installs polars/numpy/scipy/tqdm/packaging/natsort/requests/matplotlib/seaborn/networkx/plotly/colorcet plus `tcrio`, exit 0.
 
@@ -769,7 +771,7 @@ except ValueError:
 print("clean-venv smoke OK")
 PY
 ```
-Expected: prints `version: 0.1.0b1` and `clean-venv smoke OK`.
+Expected: prints `version: 0.1.0-beta.1` (the raw Cargo string via `CARGO_PKG_VERSION`; the installed wheel/`pip show` version is the PEP 440 form `0.1.0b1`) and `clean-venv smoke OK`.
 
 - [ ] **Step 5: Run the dev checks (CI proxy)**
 
@@ -780,7 +782,7 @@ Expected: fmt/clippy/ruff/mypy clean, all pytest tests pass.
 
 ```bash
 git add Cargo.toml
-git commit -m "build: set beta pre-release version 0.1.0b1"
+git commit -m "build: set beta pre-release version 0.1.0-beta.1"
 ```
 
 - [ ] **Step 7: Clean up the throwaway venv**

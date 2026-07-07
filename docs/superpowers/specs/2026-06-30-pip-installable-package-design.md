@@ -40,7 +40,7 @@ A follow-up effort can pick these up; this spec stays focused on shippability.
 | Beta channel | **GitHub Release wheels** (pre-release tag, e.g. `v0.1.0b1`) — truly private, reuses existing CI |
 | PyPI / import name | `tcrio` (distribution) / `tcr_io` (import) — minimum change, can revisit later |
 | Dependency layout | **Everything is a core dependency** for now; extras can be split out later |
-| Dependency version style | **`>=` lower bounds, no upper caps** in `pyproject.toml`; `requirements.txt` stays exact-pinned (`==`) as the dev/CI lockfile |
+| Dependency version style | **`>=` lower bounds** in `pyproject.toml`, **no upper caps except `polars`** (compiled-plugin ABI — capped `<2.0`); `requirements.txt` stays exact-pinned (`==`) as the dev/CI lockfile |
 | Dev tooling | Moved into a `[project.optional-dependencies].dev` extra |
 | HLA + CMV ops | **Bundle model files as parquet resources** in `tcr_io/resources/`; these ops work out of the box from a clean install |
 | MAIT op (`MaitHits`) | **Deferred** — not needed for beta; default `model_checkpoint=None` + clear error if used without a path |
@@ -55,7 +55,7 @@ This is the central fix. Today `[project]` declares **no** `dependencies`, so `p
 ### 3.1 Runtime dependencies (all core, `>=` lower bounds)
 Add `[project].dependencies`:
 ```
-polars>=1.42
+polars>=1.42,<2.0
 numpy>=2.2
 scipy>=1.14
 tqdm>=4.67
@@ -68,11 +68,11 @@ networkx>=3.0
 plotly>=5.0
 colorcet>=3.0
 ```
-- Lower bounds derived from the current `requirements.txt` pins (and observed imports). No upper caps (per decision).
+- Lower bounds derived from the current `requirements.txt` pins (and observed imports). No upper caps except `polars` (see ABI note below).
 - `matplotlib`/`seaborn`/`networkx`/`plotly`/`colorcet` are included even though imported lazily inside `overlap.py` plotting functions — per the "everything core" decision.
 - `requests` is required by `operations/metadata.py`.
 
-> **Note on `polars` ABI:** the Rust plugin links a specific `pyo3-polars`/`polars` version. That is a *build-time* (Cargo) constraint, not a Python runtime cap, so it does not add an upper bound to the Python dependency. Beta verification (§9) confirms the built wheel imports and runs against the resolved polars.
+> **Note on `polars` ABI (why polars is capped):** this package is a compiled **polars plugin** (pyo3-polars `register_plugin_function`). pyo3-polars checks `PYPOLARS_VERSION` between the plugin and the runtime host, and the plugin ABI is **not** stable across polars releases — a runtime polars newer than the one the wheel was built against can fail to load or error at call time. So polars (unlike the other deps) gets an upper cap. `<2.0` is the loose bound chosen for the beta; the tightest-safe bound is `<1.43` (the built minor series). Recommended: ship `<2.0`, then empirically test the wheel against a newer polars (§9) and tighten toward `<1.43` if it doesn't load. Rebuild + bump the cap whenever the build's polars moves.
 
 ### 3.2 Dev extra
 Add `[project.optional-dependencies]`:
@@ -85,7 +85,7 @@ Removes build/test tooling from the runtime set. The Makefile/CI continue to use
 Add to `[project]`: `description`, `readme = "README.md"`, `license`, `authors`, `keywords`, and `[project.urls]` (repository / homepage). Keep `requires-python` consistent with the Rust `abi3-py39` build and the CI test matrix (3.9+); update the `>=3.8` claim to `>=3.9`.
 
 ### 3.4 Version
-Keep `dynamic = ["version"]`. Version resolves from `Cargo.toml` `package.version`. For the beta, set a **pre-release** version (e.g. `0.1.0b1`) in `Cargo.toml` so the GitHub Release wheel is clearly a beta. Public release later uses a normal version (`0.1.0`).
+Keep `dynamic = ["version"]`. Version resolves from `Cargo.toml` `package.version`. Cargo requires **SemVer**, so the beta pre-release must be written `0.1.0-beta.1` (not `0.1.0b1`, which Cargo won't parse). maturin normalizes that to the PEP 440 wheel version `0.1.0b1` (so the wheel is `tcrio-0.1.0b1-…whl`), while the Python `__version__` — sourced from `env!("CARGO_PKG_VERSION")` — reads the raw Cargo string `0.1.0-beta.1`. Public release later uses a normal version (`0.1.0`).
 
 ### 3.5 `requirements.txt`
 Stays as the dev/CI lockfile with exact `==` pins. Remove redundancy as needed so it represents the dev environment (runtime deps + dev tooling), but it is **not** the source of truth for what `pip install tcrio` pulls — `pyproject.toml` is.
@@ -121,11 +121,10 @@ The CI (`make pre-commit → install → test`, with `RUSTFLAGS=-Dwarnings`) is 
    ```
    so `make test` (`pytest tests`) passes.
 
-2. **Rust warnings that fail `-Dwarnings`.**
-   - Remove the unused `use rust_stemmers::{Algorithm, Stemmer};` import in `src/expressions.rs`.
-   - Remove the now-unused `rust-stemmers` dependency from `Cargo.toml`.
-   - Remove the redundant `use std::usize;` in `src/reference_points.rs`.
-   - Build/clippy must be clean under `RUSTFLAGS=-Dwarnings` (verify with `make pre-commit`).
+2. **Rust warnings — clean imports, then relax the gate (Option A).**
+   - Remove the four unused `use` imports in `src/expressions.rs` (`num_traits::Signed`, `broadcast_binary_elementwise`, `rust_stemmers::{Algorithm, Stemmer}`, `std::fmt::Write`) and the redundant `use std::usize;` in `src/reference_points.rs`, and drop the now-unused `rust-stemmers` dependency from `Cargo.toml`.
+   - The crate carries ~50 *other* pre-existing warnings (a leftover `src/main.rs` bin target plus intentional not-yet-wired-up functions/structs). Per the maintainer, that WIP code is **kept**, not removed.
+   - **Decision (Option A):** rather than churn the WIP crate to satisfy the gate, remove `RUSTFLAGS: "-Dwarnings"` from `.github/workflows/publish_to_pypi.yml`. `cargo clippy` still runs in `make pre-commit` so warnings stay visible locally; re-enable the gate once the crate stabilizes.
 
 3. **Leaked secret.** Remove the OpenAlex `api_key` string in the commented block of `operations/metadata.py`. (User rotates the key on their side; this only removes it from the working tree — history scrubbing is out of scope for this effort but noted.)
 
@@ -146,7 +145,7 @@ Replace the hardcoded `/data/current/...` defaults. Ship the HLA and CMV model f
 - Access at runtime with `importlib.resources`, not a relative `__file__` path:
   ```python
   from importlib.resources import files
-  RESOURCES = files("tcr_io.resources")
+  RESOURCES = files("tcr_io").joinpath("resources")  # robust: no __init__.py needed in resources/
   ```
 
 ### 6.2 HLA (`HlaInference`, `RepertoireHlaInference`)
