@@ -1,9 +1,17 @@
+# Compiled / build artifacts
 *.so
 *.pyc
-target
-venv
-.venv
-*.so
 *.dll
 *.pyd
+__pycache__/
+target
 
+# Virtual environments
+venv
+.venv
+.venv*
+
+# Raw model sources (large / externally obtained) — keep only the README.
+# Generated outputs live in tcr_io/resources/ and ARE tracked.
+/model_sources/*
+!/model_sources/README.md
