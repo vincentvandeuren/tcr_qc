@@ -8,11 +8,13 @@ package will ship (see docs/superpowers/specs/2026-06-30-pip-installable-package
 Inputs (in the repo-root `model_sources/` folder; gitignored, obtained separately):
   - tcr2hla_info.zip            : TCR2HLA model archive.
   - CMV_ECOcluster_TCRs.tsv     : CMV EcoCluster TCR table (raw TSV).
+  - mait_parsed.parquet         : MAIT reference TCRs (already IMGT-processed).
 
 Outputs (written to tcr_io/resources/ in --build mode, or scratch in --inspect mode):
   - hla_tcrs.parquet           : junction_aa, v_gene, j_gene, allele, gene, score
   - hla_model_weights.parquet  : allele, coef_1, coef_2, intercept
   - cmv_ecocluster.parquet     : v_gene, j_gene, junction_aa, hla_cocluster, eco_id
+  - mait_hits.parquet          : v_gene, j_gene, junction_aa
 
 The HLA/CMV transforms reproduce the exact logic currently in
 `tcr_io/operations/hla.py` and `tcr_io/operations/cmv_hits.py`, so the bundled
@@ -45,6 +47,7 @@ RESOURCES_DIR = REPO_ROOT / "tcr_io" / "resources"
 
 HLA_ZIP = SOURCES_DIR / "tcr2hla_info.zip"
 CMV_TSV = SOURCES_DIR / "CMV_ECOcluster_TCRs.tsv"
+MAIT_PARQUET = SOURCES_DIR / "mait_parsed.parquet"
 
 # Entries we need out of the (possibly truncated) zip.
 HLA_WEIGHTS_ENTRY = "tcr2hla_info/models/TRB_weights.pickle.gz"
@@ -194,6 +197,17 @@ def build_cmv(tsv_path: Path, to_imgt, apply_imgt: bool) -> pl.DataFrame:
     return df
 
 
+def build_mait(parquet_path: Path) -> pl.DataFrame:
+    # Source is already IMGT-processed (has v_gene/j_gene); keep just the join
+    # columns MaitHits uses, deduped and null-free. No to_imgt needed.
+    return (
+        pl.read_parquet(parquet_path)
+        .select(["v_gene", "j_gene", "junction_aa"])
+        .drop_nulls()
+        .unique()
+    )
+
+
 def _report(name: str, df: pl.DataFrame, path: Path) -> None:
     size = path.stat().st_size
     print(f"  {name:<22} rows={df.height:>10,}  cols={df.width}  ->  {size/1e6:6.2f} MB  ({path})")
@@ -221,19 +235,23 @@ def main() -> None:
     hla_tcrs = build_hla_tcrs(entries[HLA_WEIGHTS_ENTRY], to_imgt, apply_imgt)
     hla_wts = build_hla_model_weights(entries[HLA_MODELS_ENTRY])
     cmv = build_cmv(CMV_TSV, to_imgt, apply_imgt)
+    mait = build_mait(MAIT_PARQUET)
 
     p1 = out_dir / "hla_tcrs.parquet"
     p2 = out_dir / "hla_model_weights.parquet"
     p3 = out_dir / "cmv_ecocluster.parquet"
+    p4 = out_dir / "mait_hits.parquet"
     write_resource(hla_tcrs, p1)
     write_resource(hla_wts, p2)
     write_resource(cmv, p3)
+    write_resource(mait, p4)
 
     print("\nresults:")
     _report("hla_tcrs", hla_tcrs, p1)
     _report("hla_model_weights", hla_wts, p2)
     _report("cmv_ecocluster", cmv, p3)
-    total = p1.stat().st_size + p2.stat().st_size + p3.stat().st_size
+    _report("mait_hits", mait, p4)
+    total = p1.stat().st_size + p2.stat().st_size + p3.stat().st_size + p4.stat().st_size
     print(f"\n  TOTAL bundled size: {total/1e6:.2f} MB")
     if not apply_imgt:
         print("  NOTE: --inspect ran WITHOUT to_imgt; gene strings are not IMGT-canonicalised.")

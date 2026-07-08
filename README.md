@@ -77,12 +77,16 @@ my_dataset/
 └── README.md                   # Optional. Auto-generated dataset card.
 ```
 
-## Beta limitations
+## Bundled models
 
-- HLA inference (`HlaInference`, `RepertoireHlaInference`) and CMV hits
-  (`ECOClusterHits`) work out of the box — their model data is bundled.
-- `MaitHits` is **not** bundled in the beta; pass your own parquet:
-  `MaitHits(model_checkpoint="path/to/mait.parquet")`.
+All model-based operations work out of the box — their reference data ships
+inside the wheel and loads automatically with no arguments:
+
+- `HlaInference` / `RepertoireHlaInference` — HLA inference
+- `ECOClusterHits` — CMV EcoCluster hits
+- `MaitHits` — MAIT hits
+
+Each also accepts `model_checkpoint=<path>` to override with your own model.
 
 ## Development
 

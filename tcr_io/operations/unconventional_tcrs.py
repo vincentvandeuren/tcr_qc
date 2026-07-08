@@ -1,6 +1,7 @@
 import math
 
 from tcr_io.operations.base import BaseOperation, OperationResults
+from tcr_io._resources import resource_path
 import polars as pl
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -150,6 +151,12 @@ class MaitHits(BaseHits):
     version = "0.6"
     description = "Counts the number of mait hits (from unconventional tcr db) for each repertoire."
     result_name_short = "mait"
+
+    def __init__(self, model_checkpoint: Optional[str | Path] = None):
+        # The MAIT reference set is bundled; default to it, allow a path override.
+        if model_checkpoint is None:
+            model_checkpoint = resource_path("mait_hits.parquet")
+        super().__init__(model_checkpoint)
 
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
         return pl.read_parquet(model_checkpoint).select(["v_gene", "j_gene", "junction_aa"]).lazy()

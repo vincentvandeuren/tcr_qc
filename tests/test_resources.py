@@ -1,6 +1,3 @@
-import pytest
-
-
 def test_hla_inference_loads_bundled_model():
     from tcr_io.operations import HlaInference
 
@@ -19,8 +16,9 @@ def test_cmv_hits_loads_bundled_model():
     assert {"v_gene", "j_gene", "junction_aa", "hla_cocluster", "eco_id"} <= cols
 
 
-def test_mait_hits_requires_checkpoint():
+def test_mait_hits_loads_bundled_model():
     from tcr_io.operations import MaitHits
 
-    with pytest.raises(ValueError, match="requires a model file"):
-        MaitHits()
+    op = MaitHits()  # no args -> bundled parquet
+    cols = set(op.query_df.collect_schema().names())
+    assert {"v_gene", "j_gene", "junction_aa"} <= cols
