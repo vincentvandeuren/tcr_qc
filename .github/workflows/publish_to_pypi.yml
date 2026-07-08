@@ -185,6 +185,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
       - name: Generate artifact attestation
+        # Build-provenance attestation is not available for user-owned PRIVATE
+        # repos. Skip it while private; it auto-enables when the repo goes public.
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: 'wheels-*/*'
