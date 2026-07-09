@@ -1,6 +1,7 @@
 # use cmv ecocluster to determing number of hits in repertoire
 from tcr_io.operations.base import BaseOperation, OperationResults
 from tcr_io._resources import resource_path
+from tcr_io.expressions import extract_genes
 import polars as pl
 from pathlib import Path
 
@@ -22,8 +23,7 @@ class ECOClusterHits(BaseOperation):
 
         for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Matching repertoires to CMV ecocluster"):
             eco_m = df.with_columns(
-                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),   
+                *extract_genes()
             ).join(
                 self.eco_df,
                 on=["v_gene", "j_gene", "junction_aa"],

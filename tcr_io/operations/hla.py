@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base import BaseOperation, OperationResults
 from .._resources import resource_path
+from ..expressions import extract_genes, extract_locus
 
 import polars as pl
 from pathlib import Path
@@ -47,12 +48,11 @@ class HlaInference(BaseHlaInferenceOperation, BaseOperation):
         dfs = []
         for patient_id, df in ds.iter_repertoires_by_patient(progress_bar=True, progress_desc="Inferring HLA for patients"):
             df = df.filter(
-                pl.col("v_call").str.starts_with("TRB")
+                extract_locus() == "TRB"
             )
             n_tcrs = df.select(pl.len()).collect()[0,0]
             df = df.with_columns(
-                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+                *extract_genes()
             ).lazy().join(
                 tcrs, on=["v_gene", "j_gene", "junction_aa"], how="inner"
             ).group_by("allele").agg(
@@ -105,12 +105,11 @@ class RepertoireHlaInference(BaseHlaInferenceOperation, BaseOperation):
         dfs = []
         for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Inferring HLA for repertoires"):
             df = df.filter(
-                pl.col("v_call").str.starts_with("TRB")
+                extract_locus() == "TRB"
             )
             n_tcrs = df.select(pl.len()).collect()[0,0]
             df = df.with_columns(
-                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+                *extract_genes()
             ).lazy().join(
                 tcrs, on=["v_gene", "j_gene", "junction_aa"], how="inner"
             ).group_by("allele").agg(

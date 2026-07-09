@@ -1,6 +1,6 @@
 # copy code from baseline technical features model
 from .base import BaseOperation, OperationResults
-from ..expressions import _determine_reference_points
+from ..expressions import _determine_reference_points, extract_genes
 from typing import TYPE_CHECKING, Literal
 import polars as pl
 from itertools import product
@@ -24,8 +24,7 @@ class GeneCountsSummary(BaseOperation):
 
         for repertoire_id, df in ds.iter_repertoires(progress_bar = True, progress_desc="Counting v/j statistics"):
             vj = df.with_columns(
-                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+                *extract_genes()
             ).group_by(["v_gene", "j_gene"]).agg(pl.len().alias("count")).with_columns(
                 pl.lit(repertoire_id).alias("repertoire_id")
             ).collect()

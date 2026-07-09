@@ -2,6 +2,7 @@ import math
 
 from tcr_io.operations.base import BaseOperation, OperationResults
 from tcr_io._resources import resource_path
+from tcr_io.expressions import extract_genes
 import polars as pl
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -74,8 +75,7 @@ class BaseHits(BaseOperation, ABC):
         ms = []
         for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc=f"Counting {name} hits in repertoires"):
             repertoire_lf = df.with_columns(
-                pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene"),
-                pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene"),
+                *extract_genes()
             )
 
             # N_j, M_j from full repertoire

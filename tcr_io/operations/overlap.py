@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, List, Literal
 import polars as pl
 from .base import BaseOperation, OperationResults
+from ..expressions import extract_genes
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -31,8 +32,7 @@ class OverlapAnalyzer(BaseOperation):
         for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Collecting heads"):
             repertoire_id_safe = repertoire_id.replace("/", "_")
             df.head(self.top_n).with_columns(
-                v_gene = pl.col("v_call").str.extract(r"(.*)\*\d{2}"),
-                j_gene = pl.col("j_call").str.extract(r"(.*)\*\d{2}"),
+                *extract_genes()
             ).sink_parquet(head_dir / f"{repertoire_id_safe}.parquet")
 
         heads_tab_dir = ds.db_dir / "temp/heads_tab"
