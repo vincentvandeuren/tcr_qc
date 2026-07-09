@@ -12,7 +12,6 @@ import shutil
 
 from .dataset import TcrDataset
 from .schema import OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META
-from .expressions import group_duplicates
 
 
 logger = logging.getLogger(__name__)

@@ -73,33 +73,3 @@ def extract_locus(
         .otherwise(None)
         .alias("locus")
     )
-
-def group_duplicates(
-        df:pl.DataFrame,
-        by:Literal['clonotype_nt', 'clonotype_aa'] = 'clonotype_nt',
-        select = [
-        "file",
-        "junction",
-        "v_call",
-        "junction_aa",
-        "j_call",
-        "duplicate_count"
-    ]
-    ):
-    if by == "clonotype_nt":
-        by = ["v_call", "junction", "j_call"]
-        df = df.group_by(by).agg(
-            pl.col("file").unique().str.join(";").alias("file"),
-            pl.col("duplicate_count").cast(int).fill_null(1).sum().alias("duplicate_count"),
-            pl.col("junction_aa").first()
-        )
-
-    elif by == "clonotype_aa":
-        by = ["v_call", "junction_aa", "j_call"]
-        df = df.group_by(by).agg(
-            pl.col("file").unique().str.join(";").alias("file"),
-            pl.col("duplicate_count").cast(int).fill_null(1).sum().alias("duplicate_count"),
-            pl.col("junction").first()
-        )
-    
-    return df.select(select).sort("duplicate_count", descending=True)

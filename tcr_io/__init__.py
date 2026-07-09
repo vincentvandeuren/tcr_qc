@@ -11,6 +11,7 @@ from .mappers import (
     ChainedMapper,
 )
 from .filters import Filterer
+from .grouper import Grouper
 from . import operations
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "DictMapper",
     "ChainedMapper",
     "Filterer",
+    "Grouper",
     "operations",
 ]

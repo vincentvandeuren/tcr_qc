@@ -51,7 +51,7 @@ from packaging.version import parse as parse_version
 from .operations.base import OperationFailure, OperationResults
 from .schema import GENERATION_META, OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, PUBLICATION_META
 from .operations import BaseOperation, OperationMeta
-from .expressions import group_duplicates
+from .grouper import Grouper
 
 
 class TcrDataset:
@@ -300,7 +300,7 @@ class TcrDataset:
 
             if deduplicate:
                 if n_files > 1:
-                    df  = group_duplicates(df)
+                    df  = Grouper().run(df)
             
             if not lazy:
                 df = df.collect(engine="streaming")

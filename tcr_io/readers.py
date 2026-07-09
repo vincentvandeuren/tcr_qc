@@ -3,10 +3,10 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Tuple, List, Dict, ClassVar, Optional, Iterable, Literal
 import gzip
-from .expressions import to_imgt, trim_junction_to_cdr3, is_functional_tcr, group_duplicates
+from .expressions import to_imgt, trim_junction_to_cdr3, is_functional_tcr
 from .filters import Filterer
+from .grouper import Grouper
 import csv
-from functools import partial
 
 
 class BaseReader(ABC):
@@ -26,17 +26,26 @@ class BaseReader(ABC):
     name: str = "abstract_reader"
     col_map: ClassVar[Dict[Iterable[str]|str, str]] = {} # Mapping from input to output
     null_values: ClassVar[List[str]] = [] # Values to treat as null
-    duplicate_group_func: callable = staticmethod(group_duplicates)
+    # Per-reader default grouper. Subclasses can point this at a different
+    # Grouper (e.g. a future SingleCellGrouper) or set it to None to skip
+    # grouping. An explicit `grouper=` arg to __init__ overrides it.
+    default_grouper: ClassVar[Grouper | None] = Grouper()
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name}, col_map={self.col_map})"
-    
+
     def __init__(self,
                  filterer: Filterer | None = None,
+                 grouper: Grouper | None = None,
                  duplicate_group_when : Optional[Literal["by_file", "by_run"]] = "by_run",
                  ):
         self.filterer = Filterer() if filterer is None else filterer
+        self.grouper = self.default_grouper if grouper is None else grouper
         self.duplicate_group_when = duplicate_group_when
+
+    @property
+    def _should_group(self) -> bool:
+        return self.grouper is not None and self.duplicate_group_when in ("by_file", "by_run")
 
     def run(self, paths:str|Path|List[Path]) -> pl.LazyFrame:
         """
@@ -59,21 +68,22 @@ class BaseReader(ABC):
     def _run_single(self, file:Path) -> pl.LazyFrame:
         df = self._read(file)
         df = self._process(df)
-        if self.duplicate_group_when in ["by_file", "by_run"]:
-            df = self.duplicate_group_func(df)
+        if self._should_group:
+            df = self.grouper.run(df)
         df = self._filter(df)
         return df
-    
+
     def _run_multiple(self, files:List[Path]) -> pl.LazyFrame:
-        if self.duplicate_group_when == "by_file":
+        if self._should_group and self.duplicate_group_when == "by_file":
             dfs = pl.concat([
-                self.duplicate_group_func(self._process(self._read(file))) for file in files
+                self.grouper.run(self._process(self._read(file))) for file in files
             ])
-        elif self.duplicate_group_when == "by_run":
+        else:
             dfs = pl.concat([
                 self._process(self._read(file)) for file in files
             ])
-            dfs = self.duplicate_group_func(dfs)
+            if self._should_group and self.duplicate_group_when == "by_run":
+                dfs = self.grouper.run(dfs)
         dfs = self._filter(dfs)
         return dfs
 
@@ -270,7 +280,10 @@ class VlasovaReader(BaseReader):
 
 class CellrangerReader(BaseReader):
     name = "cellranger"
-    duplicate_group_func = staticmethod(partial(group_duplicates, by="single_cell_nt"))
+    # TODO(single-cell): replace with a SingleCellGrouper that dedups within a
+    # cell while retaining `cell_id`. Until then, skip grouping so cells are not
+    # collapsed into clonotypes.
+    default_grouper = None
     col_map = {
         "cdr3_nt":"junction",
         "cdr3":"junction_aa",

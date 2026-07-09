@@ -7,5 +7,5 @@ def test_import_and_version():
 def test_public_api_surface():
     import tcr_io
 
-    for name in ["TcrDataset", "DatasetIngester", "ReaderFactory", "Filterer", "operations"]:
+    for name in ["TcrDataset", "DatasetIngester", "ReaderFactory", "Filterer", "Grouper", "operations"]:
         assert hasattr(tcr_io, name), name
