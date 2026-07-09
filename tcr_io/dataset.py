@@ -1,6 +1,10 @@
 """
 Dataset structure
 
+The authoritative, machine-readable definition of this layout lives in `tcr_io/layout.py`
+(the `Layout` registry). The tree below is illustrative only — resolve paths via
+`Layout.<key>.path`, never by hardcoding these strings.
+
 my_dataset/
 ├── processed_repertoires/      # One parquet per repertoire. Atomic unit.
 │   ├── sample_001.parquet      # Standardized schema, repertoire_id column
@@ -49,9 +53,9 @@ from tqdm import tqdm
 from packaging.version import parse as parse_version
 
 from .operations.base import OperationFailure, OperationResults
-from .schema import GENERATION_META, OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, PUBLICATION_META
 from .operations import BaseOperation, OperationMeta
 from .grouper import Grouper
+from .layout import Layout, REQUIRED_DIRS, repertoire_relpath
 
 
 class TcrDataset:
@@ -60,29 +64,22 @@ class TcrDataset:
     Knows structure. Provides accessors. No mutation logic.
     """
 
-    # --- Directory layout constants ---
-    PROCESSED_DIR = "processed_repertoires"
-    TABULATED_DIR = "tabulated"
-    META_DIR = "meta"
-    REPERTOIRE_META_DIR = "meta/repertoire"
-    PATIENT_META_DIR = "meta/patient"
-    PUBLICATION_DIR = "meta/publication"
-    QC_DIR = "qc"
-
-    REQUIRED_DIRS = [PROCESSED_DIR, META_DIR, REPERTOIRE_META_DIR, PATIENT_META_DIR, PUBLICATION_DIR, QC_DIR]
-
     def __init__(self, db_dir:str|Path):
         self.db_dir = Path(db_dir)
         self.db_name = self.db_dir.name
         self._validate_structure()
 
+    def path(self, artifact) -> Path:
+        """Absolute path of a layout Artifact within this dataset."""
+        return self.db_dir / artifact.path
+
     def _validate_structure(self):
         if not self.db_dir.exists():
             raise FileNotFoundError(f"Dataset directory does not exist: {self.db_dir}")
 
-        for subdir in self.REQUIRED_DIRS:
-            if not (self.db_dir / subdir).exists():
-                raise FileNotFoundError(f"Missing required subdirectory: {subdir}")
+        missing = [d for d in REQUIRED_DIRS if not (self.db_dir / d).exists()]
+        if missing:
+            raise FileNotFoundError(f"Missing required subdirectories: {', '.join(missing)}")
             
     def run_operation(self, operation:BaseOperation, force = False):
         if self._operation_exists(operation) and not force:   
@@ -136,10 +133,10 @@ class TcrDataset:
             "error" : error,
             "description" : operation.description,
             "outputs" : [outputs]
-        }, schema=OPERATIONS_META)
+        }, schema=Layout.operations_meta.schema)
 
         pl.concat([self.operations_meta, operation_meta_new]).write_ndjson(
-            self.db_dir / self.META_DIR / "operations.json"
+            self.db_dir / Layout.operations_meta.path
         )
 
     def get_operation_result(self, operation_name, output_name:Optional[str] = None) -> pl.DataFrame:
@@ -175,79 +172,85 @@ class TcrDataset:
 
     @property
     def repertoire_dir(self) -> Path:
-        return self.db_dir / self.PROCESSED_DIR
-    
+        return self.db_dir / Layout.processed_dir.path
+
     @property
     def repertoire_meta(self) -> pl.DataFrame:
+        art = Layout.repertoire_meta
         return (
-            pl.read_parquet(self.db_dir / self.REPERTOIRE_META_DIR / "repertoire.parquet")
-            .select(REPERTOIRE_META.keys())
-            .cast(REPERTOIRE_META)
+            pl.read_parquet(self.db_dir / art.path)
+            .select(art.schema.keys())
+            .cast(art.schema)
         )
 
     @property
     def full_repertoire_meta(self) -> pl.DataFrame:
         rep = self.repertoire_meta
 
-        if (self.db_dir / self.REPERTOIRE_META_DIR / "repertoire_meta.parquet").exists():
-            rep_meta = pl.read_parquet(self.db_dir / self.REPERTOIRE_META_DIR / "repertoire_meta.parquet")
-            rep = rep.join(rep_meta, on="repertoire_id", how="left")
-        
+        extra = self.db_dir / Layout.repertoire_meta_extra.path
+        if extra.exists():
+            rep = rep.join(pl.read_parquet(extra), on="repertoire_id", how="left")
+
         return rep
 
     @property
     def patient_meta(self) -> pl.DataFrame:
+        art = Layout.patient_meta
         return (
-            pl.read_parquet(self.db_dir / self.PATIENT_META_DIR / "patient.parquet")
-            .select(PATIENT_META.keys())
-            .cast(PATIENT_META)
+            pl.read_parquet(self.db_dir / art.path)
+            .select(art.schema.keys())
+            .cast(art.schema)
         )
 
     @property
     def full_patient_meta(self) -> pl.DataFrame:
         pat = self.patient_meta
-        if (self.db_dir / self.PATIENT_META_DIR / "patient_meta.parquet").exists():
-            pat_meta = pl.read_parquet(self.db_dir / self.PATIENT_META_DIR / "patient_meta.parquet")
-            pat = pat.join(pat_meta, on="patient_id", how="left")
 
-        if (self.db_dir / self.PATIENT_META_DIR / "hla.parquet").exists():
-            pat_meta = pl.read_parquet(self.db_dir / self.PATIENT_META_DIR / "hla.parquet")
-            pat = pat.join(pat_meta, on="patient_id", how="left")
-        
+        extra = self.db_dir / Layout.patient_meta_extra.path
+        if extra.exists():
+            pat = pat.join(pl.read_parquet(extra), on="patient_id", how="left")
+
+        hla = self.db_dir / Layout.hla.path
+        if hla.exists():
+            pat = pat.join(pl.read_parquet(hla), on="patient_id", how="left")
+
         return pat
-    
+
     @cached_property
     def publication_meta(self) -> dict:
+        art = Layout.publication_ids
         return (
-            pl.read_ndjson(self.db_dir / self.PUBLICATION_DIR / "publication_ids.json", schema=PUBLICATION_META)
+            pl.read_ndjson(self.db_dir / art.path, schema=art.schema)
         ).to_dict(as_series=False)
-    
+
     @cached_property
     def full_publication_meta(self) -> pl.DataFrame:
         pub = pl.DataFrame(self.publication_meta)
 
-        if (self.db_dir / self.PUBLICATION_DIR / "publication.parquet").exists():
-            pub_meta = pl.read_parquet(self.db_dir / self.PUBLICATION_DIR / "publication.parquet")
-            pub = pub.join(pub_meta, on="publication_id", how="left")
-        
+        pub_extra = self.db_dir / Layout.publication_meta.path
+        if pub_extra.exists():
+            pub = pub.join(pl.read_parquet(pub_extra), on="publication_id", how="left")
+
         return pub
-        
+
     @cached_property
     def generation_meta(self) -> dict:
+        art = Layout.generation_meta
         return (
-            pl.read_ndjson(self.db_dir / self.META_DIR / "generation.json", schema=GENERATION_META)
+            pl.read_ndjson(self.db_dir / art.path, schema=art.schema)
         ).to_dicts()[0]
-    
+
     @property
     def operations_meta(self) -> pl.DataFrame:
+        art = Layout.operations_meta
         return (
-            pl.read_ndjson(self.db_dir / self.META_DIR / "operations.json", schema=OPERATIONS_META)
+            pl.read_ndjson(self.db_dir / art.path, schema=art.schema)
         )
 
     @property
     def operations(self) -> List[OperationMeta]:
         operations = []
-        with open(self.db_dir/"meta/operations.json", "r") as f:
+        with open(self.db_dir / Layout.operations_meta.path, "r") as f:
             for line in f.readlines():
                 json_obj = json.loads(line)
                 operations.append(OperationMeta(**json_obj))
@@ -291,7 +294,7 @@ class TcrDataset:
             progress = tqdm(total=patient_meta.select(pl.col("patient_id").n_unique())[0, 0], desc=desc)
 
         for patient, patient_repertoires, in self.patient_meta.select("patient_id", "patient_repertoires").iter_rows():
-            files = [self.repertoire_dir / f"{rep_id.replace('/', '_')}.parquet" for rep_id in patient_repertoires]
+            files = [self.db_dir / repertoire_relpath(rep_id) for rep_id in patient_repertoires]
             n_files = len(files)
 
             df = pl.concat([pl.scan_parquet(f).with_columns(file=pl.lit(f.name)) for f in files])

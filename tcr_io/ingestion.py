@@ -11,6 +11,7 @@ import shutil
 
 
 from .dataset import TcrDataset
+from .layout import Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath
 from .schema import OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META
 
 
@@ -23,7 +24,7 @@ def _process_path_wildcards(f: Path|str) -> List[Path]:
         return [path]
     elif path.is_dir():
         return list(path.iterdir())
-    elif "*" in f:
+    elif "*" in f.name:
         return list(path.parent.glob(path.name))
     else:
         raise ValueError(f"Path {f} is not a file, directory, or wildcard pattern.")
@@ -58,7 +59,7 @@ class DatasetIngester:
                 logger.warning(f"Dataset directory {self.db_dir} already exists and will be overwritten.")
                 self._delete_existing_data() # only remove processed_repertoires at this point
 
-        for subdir in TcrDataset.REQUIRED_DIRS + [TcrDataset.TABULATED_DIR]:
+        for subdir in REQUIRED_DIRS + GENERATED_DIRS:
             (self.db_dir / subdir).mkdir(parents=True, exist_ok=True)
 
         
@@ -100,19 +101,19 @@ class DatasetIngester:
         logger.info(f"Mapping created. {len(repertoires)} repertoires mapped from {len(set(repertoires_to_patients.values()))} unique patients, {len(skipped)} files skipped.")
         self._process_repertoires(repertoires)
         self._generate_repertoire_metadata(repertoires, repertoires_to_patients).write_parquet(
-            self.db_dir / "meta" / "repertoire" / "repertoire.parquet"
+            self.db_dir / Layout.repertoire_meta.path
         )
         self._generate_patient_metadata(repertoires_to_patients).write_parquet(
-            self.db_dir / "meta" / "patient" / "patient.parquet"
+            self.db_dir / Layout.patient_meta.path
         )
         self._generate_publication_metadata().write_ndjson(
-            self.db_dir / "meta" / "publication" / "publication_ids.json"
+            self.db_dir / Layout.publication_ids.path
         )
         self._generate_generation_metadata(dir).write_ndjson(
-            self.db_dir / "meta" / "generation.json"
+            self.db_dir / Layout.generation_meta.path
         )
         self._generate_operations_metadata().write_ndjson(
-            self.db_dir / "meta" / "operations.json"
+            self.db_dir / Layout.operations_meta.path
         )
 
         logger.info("Dataset processing complete.")
@@ -127,10 +128,7 @@ class DatasetIngester:
                 pl.lit(repertoire_id).alias("repertoire_id")
             ).select(REPERTOIRE.keys()).cast(REPERTOIRE)
 
-
-            repertoire_id_safe = repertoire_id.replace("/", "_")
-
-            df.sink_parquet(self.db_dir/"processed_repertoires"/f"{repertoire_id_safe}.parquet")
+            df.sink_parquet(self.db_dir / repertoire_relpath(repertoire_id))
 
     def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients) -> pl.DataFrame:
 
@@ -142,7 +140,7 @@ class DatasetIngester:
 
         rep_sizes = []
 
-        for f in (self.db_dir/"processed_repertoires").glob("*.parquet"):
+        for f in (self.db_dir / Layout.processed_dir.path).glob("*.parquet"):
             s = pl.scan_parquet(f).select(
                 pl.first("repertoire_id"),
                 pl.sum("filter_pass").alias("n_clonotypes"),
@@ -204,7 +202,7 @@ class DatasetIngester:
         return df.select(OPERATIONS_META.keys()).cast(OPERATIONS_META)
 
     def _delete_existing_data(self):
-        shutil.rmtree(self.db_dir/"processed_repertoires")
+        shutil.rmtree(self.db_dir / Layout.processed_dir.path)
         
     def _test_mappers(self, dir:Path|str):
         dir : List[Path] = _process_path_wildcards(dir)
