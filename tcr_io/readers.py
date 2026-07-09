@@ -10,6 +10,19 @@ from functools import partial
 
 
 class BaseReader(ABC):
+    """
+    Repertoire reader steps: 
+    When duplicate_group_when is 'by_run' (default):
+
+    1. Read
+    2. Process (standardize columns, map gene aliases to IMGT, trim junctions)
+    3. Concatenate (if multiple files) 
+    4. Group duplicates
+    5. Filter
+
+    When duplicate_group_when is 'by_file', step 3 and 4 are swapped
+    When duplicate_group is None, step 4 is skipped
+    """
     name: str = "abstract_reader"
     col_map: ClassVar[Dict[Iterable[str]|str, str]] = {} # Mapping from input to output
     null_values: ClassVar[List[str]] = [] # Values to treat as null
@@ -19,10 +32,10 @@ class BaseReader(ABC):
         return f"{self.__class__.__name__}(name={self.name}, col_map={self.col_map})"
     
     def __init__(self,
-                 filterer: Filterer = Filterer(),
+                 filterer: Filterer | None = None,
                  duplicate_group_when : Optional[Literal["by_file", "by_run"]] = "by_run",
                  ):
-        self.filterer = filterer
+        self.filterer = Filterer() if filterer is None else filterer
         self.duplicate_group_when = duplicate_group_when
 
     def run(self, paths:str|Path|List[Path]) -> pl.LazyFrame:
@@ -153,9 +166,11 @@ class BaseReader(ABC):
         if self.filterer is not None:
             df = self.filterer.run(df)
         return df
+    
 
 
 class MixcrReader(BaseReader):
+    name = "mixcr"
     col_map = {
         "nSeqCDR3": "junction",
         "aaSeqCDR3": "junction_aa",
@@ -163,7 +178,6 @@ class MixcrReader(BaseReader):
         ("allJHitsWithScore", "bestJGene"): "j_call",
         ("uniqueMoleculeCount", "cloneCount", "readCount"): "duplicate_count",
     }
-    name = "mixcr"
     
     def _process(self, df):
         df = df.with_columns(
@@ -178,6 +192,7 @@ class MixcrReader(BaseReader):
 
 
 class AdaptiveReader(BaseReader):
+    name = "adaptive"
     col_map = {
         ("nucleotide","rearrangement", "cdr3_rearrangement"): "junction",
         ("aminoAcid","amino_acid", "cdr3_amino_acid"): "junction_aa",
@@ -186,7 +201,6 @@ class AdaptiveReader(BaseReader):
         ("count (templates/reads)","templates", "seq_reads", "copy", "count", "count (reads)"):"duplicate_count",
     }
     null_values = ["unknown", "unresolved", "NA", "na"]
-    name = "adaptive"
     
     def _process(self, df):
         df = df.with_columns(
@@ -198,6 +212,7 @@ class AdaptiveReader(BaseReader):
 
     
 class AirrReader(BaseReader):
+    name = "airr"
     col_map = {
     "junction":"junction",
     "junction_aa":"junction_aa",
@@ -205,7 +220,6 @@ class AirrReader(BaseReader):
     "j_call":"j_call",
     ("umi_count","duplicate_count", "count"):"duplicate_count",
     }
-    name = "airr"
 
     def _process(self, df):
         df =  df.with_columns(
@@ -218,6 +232,7 @@ class AirrReader(BaseReader):
         
 
 class TcrdistReader(BaseReader):
+    name = "tcrdist"
     col_map = {
         "cdr3":"junction_aa",
         "cdr3_nucseq":"junction",
@@ -225,7 +240,6 @@ class TcrdistReader(BaseReader):
         "j_gene":"j_call",
         "clone_size":"duplicate_count"
     }
-    name = "tcrdist"
     
     def _process(self, df):
         df =  df.with_columns(
@@ -237,6 +251,7 @@ class TcrdistReader(BaseReader):
 
         
 class VlasovaReader(BaseReader):
+    name = "vlasova"
     col_map = {
         "cdr3nt":"junction",
         "cdr3aa":"junction_aa",
@@ -244,7 +259,6 @@ class VlasovaReader(BaseReader):
         "j":"j_call",
         "count":"duplicate_count",
     }
-    name = "vlasova"
 
     def _process(self, df):
         df =  df.with_columns(
@@ -255,6 +269,8 @@ class VlasovaReader(BaseReader):
         return df
 
 class CellrangerReader(BaseReader):
+    name = "cellranger"
+    duplicate_group_func = staticmethod(partial(group_duplicates, by="single_cell_nt"))
     col_map = {
         "cdr3_nt":"junction",
         "cdr3":"junction_aa",
@@ -262,7 +278,7 @@ class CellrangerReader(BaseReader):
         "j_gene":"j_call",
         "umis":"duplicate_count",
         "is_cell":"is_cell",
-        "barcode":"clone_id",
+        "barcode":"cell_id",
     }
     
     def _process(self, df):
@@ -274,6 +290,7 @@ class CellrangerReader(BaseReader):
         return df
     
 class SynapseReader(BaseReader):
+    name = "synapse"
     col_map = {
         "cdr3":"junction",
         "cdr3_aa":"junction_aa",
@@ -349,6 +366,7 @@ class PogorelyyMixcrReader(MixcrReader, BaseReader):
     }
 
 class KoshlanTcrdistReader(AirrReader, BaseReader):
+    name = "tcrdist3_koshlan"
     col_map = {
         "cdr3_b_aa":"junction_aa",
         "cdr3_rearrangement":"junction",
@@ -356,7 +374,6 @@ class KoshlanTcrdistReader(AirrReader, BaseReader):
         "j_b_gene":"j_call",
         "templates":"duplicate_count"
     }
-    name = "tcrdist3_koshlan"
 
 immunarch_gene_map = {
     'TRBV13-1': 'TRBV13',
@@ -376,6 +393,7 @@ immunarch_gene_map = {
 }
 
 class ImmunArchReader(AirrReader, BaseReader):
+    name = "immunearch"
     col_map = {
     "CDR3.nt":"junction",
     "CDR3.aa":"junction_aa",
@@ -383,7 +401,6 @@ class ImmunArchReader(AirrReader, BaseReader):
     "J.name":"j_call",
     "Clones":"duplicate_count",
     }
-    name = "immunearch"
 
     def _process(self, df):
         df = df.with_columns(
@@ -392,6 +409,7 @@ class ImmunArchReader(AirrReader, BaseReader):
         return super()._process(df)
     
 class TcrDbReader(AirrReader, BaseReader):
+    name = "tcrdb"
     col_map = {
         "NNSeq":"junction",
         "AASeq":"junction_aa",
