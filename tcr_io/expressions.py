@@ -50,6 +50,30 @@ def is_functional_tcr(
     ) -> pl.Expr:
     return _is_functional_tcr(v_call, j_call, organism).alias("is_functional")
 
+def extract_genes(
+        v_call = pl.col("v_call"),
+        j_call = pl.col("j_call")
+        ):
+    v = v_call.str.extract(r"(.*)\*\d{2}").alias("v_gene")
+    j = j_call.str.extract(r"(.*)\*\d{2}").alias("j_gene")
+    return v, j
+
+
+def extract_locus(
+        v_call = pl.col("v_call"),
+        j_call = pl.col("j_call")
+    ) -> pl.Expr:
+    v = v_call.str.slice(0, 3)
+    j = j_call.str.slice(0, 3)
+    # Locus is the 3-char prefix of the gene call (TRB, IGH, ...).
+    # If V and J disagree (or either is null), the row's locus is undefined -> null.
+    return (
+        pl.when(v == j)
+        .then(v)
+        .otherwise(None)
+        .alias("locus")
+    )
+
 def group_duplicates(
         df:pl.DataFrame,
         by:Literal['clonotype_nt', 'clonotype_aa'] = 'clonotype_nt',
