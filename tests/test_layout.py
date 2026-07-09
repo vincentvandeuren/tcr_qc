@@ -1,5 +1,5 @@
 """Layout registry: key/name consistency and the derived tree."""
-from tcr_io.layout import Layout, LAYOUT, Kind, render_tree
+from tcr_io.structure import Layout, LAYOUT, Kind, render_tree
 
 
 def test_keys_match_attribute_names():

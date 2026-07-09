@@ -11,9 +11,10 @@ import shutil
 
 
 from .dataset import TcrDataset
-from .layout import Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath
-from .version import Manifest
-from .schema import OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META
+from .structure import (
+    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath, Manifest,
+    OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
+)
 
 
 logger = logging.getLogger(__name__)

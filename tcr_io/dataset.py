@@ -56,8 +56,7 @@ from packaging.version import parse as parse_version
 from .operations.base import OperationFailure, OperationResults
 from .operations import BaseOperation, OperationMeta
 from .grouper import Grouper
-from .layout import Layout, REQUIRED_DIRS, repertoire_relpath
-from .version import Manifest, DATASET_VERSION
+from .structure import Layout, REQUIRED_DIRS, repertoire_relpath, Manifest, DATASET_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +127,7 @@ class TcrDataset:
     def migrate(self, target: int = DATASET_VERSION, *, dry_run: bool = False) -> list:
         """Apply registered migrations to bring the dataset up to ``target``. Commits the
         manifest after each step so a mid-chain failure leaves a resumable state."""
-        from . import migrations   # lazy: avoids dataset<->migrations import cycle
+        from .structure import migrations   # lazy: avoids dataset<->migrations import cycle
 
         plan, v = [], self.version
         while v < target:

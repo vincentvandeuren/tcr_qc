@@ -154,5 +154,5 @@ def render_tree(root_name: str = "dataset", examples: bool = True) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":   # python -m tcr_io.layout
+if __name__ == "__main__":   # python -m tcr_io.structure.layout
     print(render_tree())

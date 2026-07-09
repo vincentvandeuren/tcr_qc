@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict, fields
 import json
 from pathlib import Path
 
-from ._internal import __version__ as _tcrio_version
+from .._internal import __version__ as _tcrio_version
 
 DATASET_VERSION = 1   # current on-disk dataset version; the layout as of the registry IS v1
 

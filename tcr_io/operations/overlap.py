@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, List, Literal
 import polars as pl
 from .base import BaseOperation, OperationResults
 from ..expressions import extract_genes
-from ..layout import safe_repertoire_name
+from ..structure import safe_repertoire_name
 from tqdm import tqdm
 
 if TYPE_CHECKING:

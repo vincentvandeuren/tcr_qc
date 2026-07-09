@@ -7,11 +7,10 @@ from pathlib import Path
 import polars as pl
 
 from tcr_io import TcrDataset
-from tcr_io.layout import Layout, REQUIRED_DIRS, GENERATED_DIRS
-from tcr_io.version import Manifest, DATASET_VERSION
-from tcr_io import migrations
-from tcr_io.migrations.base import Migration
-import tcr_io.schema as S
+from tcr_io.structure import Layout, REQUIRED_DIRS, GENERATED_DIRS, Manifest, DATASET_VERSION
+from tcr_io.structure import migrations
+from tcr_io.structure.migrations.base import Migration
+import tcr_io.structure.schema as S
 
 
 def _make_dataset(manifest_version=None) -> Path:
