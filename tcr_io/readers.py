@@ -452,7 +452,9 @@ class ReaderFactory:
                 paths = [paths]
             elif "*" in paths.name:
                 paths = list(paths.parent.glob(paths.name))
-        
+        if not isinstance(paths, list):
+            paths = list(paths)  # materialize generators / other iterables so paths[0] works
+
         first_file = paths[0]
         header, sep = self.base_reader()._read_header(first_file)
 
