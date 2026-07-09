@@ -43,6 +43,7 @@ my_dataset/
 from __future__ import annotations
 from functools import cached_property
 import json
+import logging
 import warnings
 from time import time
 from datetime import datetime
@@ -56,6 +57,9 @@ from .operations.base import OperationFailure, OperationResults
 from .operations import BaseOperation, OperationMeta
 from .grouper import Grouper
 from .layout import Layout, REQUIRED_DIRS, repertoire_relpath
+from .version import Manifest, DATASET_VERSION
+
+log = logging.getLogger(__name__)
 
 
 class TcrDataset:
@@ -67,19 +71,85 @@ class TcrDataset:
     def __init__(self, db_dir:str|Path):
         self.db_dir = Path(db_dir)
         self.db_name = self.db_dir.name
-        self._validate_structure()
+        self._validate_dirs()
+        self._check_version()
+
+    @classmethod
+    def migrated(cls, db_dir:str|Path) -> "TcrDataset":
+        """Alternative constructor: open a dataset, upgrading it **in place** to the current
+        version first. Unlike ``TcrDataset(path)`` (which only warns when behind), this mutates
+        the dataset on disk via ``.migrate()`` and returns a handle at ``DATASET_VERSION``."""
+        ds = cls.__new__(cls)
+        ds.db_dir = Path(db_dir)
+        ds.db_name = ds.db_dir.name
+        if not ds.db_dir.exists():
+            raise FileNotFoundError(f"Dataset directory does not exist: {ds.db_dir}")
+        ds.migrate()          # brings structure AND version up to current, on a possibly-old tree
+        ds._validate_dirs()   # now the tree matches the current layout
+        ds._check_version()   # equal -> silent
+        return ds
 
     def path(self, artifact) -> Path:
         """Absolute path of a layout Artifact within this dataset."""
         return self.db_dir / artifact.path
 
-    def _validate_structure(self):
+    @cached_property
+    def _manifest(self) -> Manifest:
+        return Manifest.read(self.db_dir / Layout.manifest.path)
+
+    @property
+    def version(self) -> int:
+        return self._manifest.version
+
+    def _validate_dirs(self):
         if not self.db_dir.exists():
             raise FileNotFoundError(f"Dataset directory does not exist: {self.db_dir}")
 
         missing = [d for d in REQUIRED_DIRS if not (self.db_dir / d).exists()]
         if missing:
             raise FileNotFoundError(f"Missing required subdirectories: {', '.join(missing)}")
+
+    def _check_version(self):
+        disk, lib = self.version, DATASET_VERSION
+        match (disk > lib) - (disk < lib):        # -1 behind, 0 equal, +1 ahead
+            case 0:
+                return
+            case -1:
+                warnings.warn(
+                    f"Dataset is v{disk}, library expects v{lib}. "
+                    f"Open with TcrDataset.migrated(path) to upgrade it in place.",
+                    stacklevel=2,
+                )
+            case 1:
+                raise RuntimeError(
+                    f"Dataset is v{disk} but this tcrio only understands v{lib}. Upgrade tcrio."
+                )
+
+    def migrate(self, target: int = DATASET_VERSION, *, dry_run: bool = False) -> list:
+        """Apply registered migrations to bring the dataset up to ``target``. Commits the
+        manifest after each step so a mid-chain failure leaves a resumable state."""
+        from . import migrations   # lazy: avoids dataset<->migrations import cycle
+
+        plan, v = [], self.version
+        while v < target:
+            step = migrations.REGISTRY.get(v + 1)
+            if step is None:
+                raise RuntimeError(f"No migration registered for v{v} -> v{v + 1}")
+            plan.append(step)
+            v = step.to_version
+
+        for step in plan:
+            log.info("migrate v%d -> v%d: %s", step.to_version - 1, step.to_version, step.description)
+            if not dry_run:
+                step.fn(self)
+                self._write_version(step.to_version)   # commit after each step
+        return plan
+
+    def _write_version(self, v: int) -> None:
+        Manifest(version=v, tcrio_version=Manifest.current().tcrio_version).write(
+            self.db_dir / Layout.manifest.path
+        )
+        self.__dict__.pop("_manifest", None)   # invalidate cached_property -> version re-reads
             
     def run_operation(self, operation:BaseOperation, force = False):
         if self._operation_exists(operation) and not force:   

@@ -12,6 +12,7 @@ import shutil
 
 from .dataset import TcrDataset
 from .layout import Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath
+from .version import Manifest
 from .schema import OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META
 
 
@@ -115,6 +116,7 @@ class DatasetIngester:
         self._generate_operations_metadata().write_ndjson(
             self.db_dir / Layout.operations_meta.path
         )
+        Manifest.current().write(self.db_dir / Layout.manifest.path)
 
         logger.info("Dataset processing complete.")
         return TcrDataset(self.db_dir)

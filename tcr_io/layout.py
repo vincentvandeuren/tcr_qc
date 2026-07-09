@@ -27,6 +27,7 @@ class Kind(Enum):
     DIR = "dir"
     PARQUET = "parquet"
     NDJSON = "ndjson"
+    JSON = "json"       # single pretty-printed object (e.g. the version manifest)
 
 
 class Role(Enum):
@@ -61,6 +62,9 @@ class Layout:
     publication_dir     = Artifact("meta/publication", Kind.DIR)
     qc_dir              = Artifact("qc", Kind.DIR)
     tabulated_dir       = Artifact("tabulated", Kind.DIR, role=Role.GENERATED)
+
+    # --- version manifest (absent on pre-versioning datasets -> optional) ---
+    manifest = Artifact("meta/manifest.json", Kind.JSON, role=Role.OPTIONAL)
 
     # --- core files (written at ingestion; carry schemas) ---
     generation_meta = Artifact("meta/generation.json", Kind.NDJSON, schema=schema.GENERATION_META)
