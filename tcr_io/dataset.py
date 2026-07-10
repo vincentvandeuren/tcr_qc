@@ -6,12 +6,13 @@ The authoritative, machine-readable definition of this layout lives in `tcr_io/l
 `Layout.<key>.path`, never by hardcoding these strings.
 
 my_dataset/
-├── processed_repertoires/      # One parquet per (repertoire, locus). Atomic unit.
-│   ├── TRB/                     # Locus is the directory segment (not a column).
-│   │   ├── sample_001.parquet   # Standardized schema, repertoire_id column
-│   │   └── sample_002.parquet
-│   └── TRA/
-│       └── sample_001.parquet
+├── processed_repertoires/      # One directory per repertoire, hive-partitioned by locus.
+│   ├── sample_001/             # Written in one pl.PartitionBy streaming pass.
+│   │   ├── locus=TRB/sample_001.parquet   # Standardized schema; locus is in the PATH, not the file.
+│   │   ├── locus=TRA/sample_001.parquet
+│   │   └── locus=_unassigned/sample_001.parquet   # QC: rows with no derivable locus (excluded from loci).
+│   └── sample_002/
+│       └── locus=TRB/sample_002.parquet
 │
 ├── meta/                       # Canonical dataset tables ONLY (no op outputs).
 │   ├── generation.json # One row per dataset generation. Metadata about when, how, source, etc.
@@ -56,10 +57,12 @@ from .operations.base import (
 from .operations import BaseOperation
 from .grouper import Grouper
 from .structure import (
-    Layout, REQUIRED_DIRS, repertoire_relpath, repertoire_meta_relpath, operation_relpath,
+    Layout, REQUIRED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath, loci_glob,
+    repertoire_meta_relpath, operation_relpath,
     write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION,
 )
 from .structure import schema as _schema
+from .expressions import UNASSIGNED
 
 log = logging.getLogger(__name__)
 
@@ -182,19 +185,18 @@ class TcrDataset:
         return plan
 
     def _write_version(self, v: int) -> None:
-        Manifest(version=v, tcrio_version=Manifest.current().tcrio_version).write(
-            self.db_dir / Layout.manifest.path
-        )
+        # Preserve present_loci (and any other manifest fields set by ingestion/migration) when a
+        # migration bumps the version — reconstructing a bare Manifest here would wipe them.
+        cur = Manifest.read(self.db_dir / Layout.manifest.path)
+        Manifest(version=v, tcrio_version=Manifest.current().tcrio_version,
+                 present_loci=cur.present_loci).write(self.db_dir / Layout.manifest.path)
         self.__dict__.pop("_manifest", None)   # invalidate cached_property -> version re-reads
-            
+
     def _present_loci(self) -> frozenset:
-        """Loci actually present in the dataset, read from the ``processed_repertoires/<LOCUS>/``
-        subdirectories (locus is the directory segment, not a column). Drives the per-locus
-        fan-out in `run_operation`."""
-        processed = self.db_dir / Layout.processed_dir.path
-        if not processed.exists():
-            return frozenset()
-        return frozenset(p.name for p in processed.iterdir() if p.is_dir())
+        """Loci present in the dataset — recorded in the manifest at ingestion and fixed thereafter
+        (O(1) read, no globbing). Drives the per-locus fan-out in `run_operation`. Excludes the
+        `_unassigned` QC bucket (never recorded as a present locus)."""
+        return frozenset(self._manifest.present_loci)
 
     def run_operation(self, operation: BaseOperation, *, force: bool = False):
         """Run an operation across the loci it supports, writing name-keyed outputs under
@@ -448,13 +450,30 @@ class TcrDataset:
         return records
 
     def _repertoire_files(self, locus: Optional[str] = None) -> List[Path]:
-        """Processed parquet paths, from the ``<LOCUS>/`` subdirs. ``locus=None`` -> all present
-        loci; a specific locus -> only that subdir. The iterator owns locus filtering (E2)."""
+        """Processed parquet paths (one per repertoire) for a locus, from the hive partitions
+        ``*/locus={LOCUS}/*.parquet``. ``locus=None`` -> all present loci (excludes `_unassigned`);
+        a specific locus (including ``"_unassigned"``) -> just that partition. The iterator owns
+        locus filtering (E2)."""
         loci = sorted(self._present_loci()) if locus is None else [locus]
         files = []
         for l in loci:
-            files.extend(sorted((self.repertoire_dir / l).glob("*.parquet")))
+            files.extend(sorted(self.db_dir.glob(loci_glob(l))))
         return files
+
+    def read_repertoire(self, repertoire_id: str, locus: Optional[str] = None,
+                        lazy: bool = False, filter_pass_only: bool = False):
+        """Read one repertoire. ``locus=None`` hive-scans the whole repertoire dir and returns a
+        ``locus`` column (recovered from the path) — the paired-chain access path (excludes the
+        `_unassigned` bucket); a specific ``locus`` reads that one partition. Returns a
+        DataFrame (or LazyFrame if ``lazy``)."""
+        if locus is None:
+            lf = pl.scan_parquet(self.db_dir / repertoire_dir_relpath(repertoire_id),
+                                 hive_partitioning=True).filter(pl.col("locus") != UNASSIGNED)
+        else:
+            lf = pl.scan_parquet(self.db_dir / repertoire_locus_relpath(repertoire_id, locus))
+        if filter_pass_only:
+            lf = lf.filter(pl.col("filter_pass"))
+        return lf if lazy else lf.collect(engine="streaming")
 
     def iter_repertoires(self, locus:Optional[str]=None, lazy=True, progress_bar=False, filter_pass_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
         files = self._repertoire_files(locus)
@@ -495,9 +514,9 @@ class TcrDataset:
             # Rebuild per-locus paths from the (unchanged) repertoire-id list; a repertoire only
             # has a file for the loci it actually produced, so keep the ones that exist.
             files = [
-                self.db_dir / repertoire_relpath(rep_id, l)
+                self.db_dir / repertoire_locus_relpath(rep_id, l)
                 for rep_id in patient_repertoires for l in loci
-                if (self.db_dir / repertoire_relpath(rep_id, l)).exists()
+                if (self.db_dir / repertoire_locus_relpath(rep_id, l)).exists()
             ]
             n_files = len(files)
 
@@ -521,6 +540,63 @@ class TcrDataset:
             if progress_bar:
                 progress.update(1)
     
+    def map_repertoires(
+            self,
+            fn,
+            *,
+            locus: Optional[str] = None,
+            filter_pass_only: bool = True,
+            lazy: bool = True,
+            tag_repertoire_id: bool = True,
+            tag_locus: bool = False,
+            concat: bool = True,
+            schema: Optional[pl.Schema] = None,
+            progress_bar: bool = False,
+            progress_desc: Optional[str] = None,
+        ):
+        """Map ``fn`` over each repertoire, tag ``repertoire_id`` (and optionally ``locus``), and
+        concatenate. Consolidates the "iterate -> apply -> tag -> collect -> concat" loop shared
+        by the per-repertoire ops, and is the single place the locus loop + locus tagging live
+        (E2): ``locus=None`` spans all present loci, an op forwards the ``locus`` it was handed in
+        ``_run(ds, locus)``.
+
+        Each repertoire's (small) result is **collected eagerly, one at a time**, then the eager
+        parts are concatenated — this bounds the working set to a single repertoire and does NOT
+        build one lazy plan over every repertoire (which can explode memory for large sets).
+        ``fn`` receives a lazy frame by default (``lazy=True``) so its own work stays lazy until
+        the per-rep collect. Returns an eager ``DataFrame`` (or the list of eager parts when
+        ``concat=False``). On an empty repertoire set, returns an empty frame if ``schema`` is
+        given, else raises."""
+        parts = []
+        for rep_id, rep in self.iter_repertoires(
+            locus=locus, lazy=lazy, filter_pass_only=filter_pass_only,
+            progress_bar=progress_bar, progress_desc=progress_desc,
+        ):
+            part = fn(rep)
+            tags = []
+            if tag_repertoire_id:
+                tags.append(pl.lit(rep_id).alias("repertoire_id"))
+            if tag_locus:
+                if locus is None:
+                    raise ValueError("map_repertoires(tag_locus=True) requires a specific locus, not None.")
+                tags.append(pl.lit(locus).alias("locus"))
+            if tags:
+                part = part.with_columns(*tags)
+            if isinstance(part, pl.LazyFrame):
+                part = part.collect(engine="streaming")   # per-repertoire collect: bounded memory
+            parts.append(part)
+
+        if not concat:
+            return parts
+        if not parts:
+            if schema is not None:
+                return pl.DataFrame(schema=schema)
+            raise ValueError(
+                f"map_repertoires produced no repertoires (locus={locus!r}); pass schema= to "
+                f"get a typed-empty frame instead of raising."
+            )
+        return pl.concat(parts)
+
     @cached_property
     def n_repertoires(self):
         """Number of samples: unique ``repertoire_id`` across all loci (grain unchanged)."""

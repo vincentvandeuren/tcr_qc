@@ -82,8 +82,7 @@ class BaseHits(BaseOperation, ABC):
         """
         name = self.result_name_short
 
-        ms = []
-        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc=f"Counting {name} hits in repertoires"):
+        def hit_metrics(df):
             repertoire_lf = df.with_columns(
                 *extract_genes()
             )
@@ -113,9 +112,8 @@ class BaseHits(BaseOperation, ABC):
                     .sum().alias("t_ln_t_sum"),
             )
 
-            # Combine + derive final metrics — single collect
-            m = repo_stats.join(hit_stats, how="cross").select(
-                pl.lit(repertoire_id).alias("repertoire_id"),
+            # Combine + derive final metrics; repertoire_id is tagged by map_repertoires.
+            return repo_stats.join(hit_stats, how="cross").select(
                 pl.col("n_hits").fill_null(0).alias(f"n_{name}_hits"),
                 pl.col("total_dup").fill_null(0).alias(f"total_{name}_duplicates"),
                 pl.col("median_dup").fill_null(0.0).alias(f"median_{name}_duplicates"),
@@ -143,12 +141,15 @@ class BaseHits(BaseOperation, ABC):
                     .exp() / pl.col("n_hits").cast(pl.Float64)
                 ).when(pl.col("n_hits") == 1).then(1.0)
                 .otherwise(0.0).alias(f"{name}_evenness"),
-            ).collect()
+            )
 
-            ms.append(m)
+        ms = ds.map_repertoires(
+            hit_metrics, locus=locus, progress_bar=True,
+            progress_desc=f"Counting {name} hits in repertoires",
+        )   # eager: per-rep collect inside the helper
 
         hits_df = ds.repertoire_meta(locus).select(["repertoire_id"]).join(
-            pl.concat(ms),
+            ms,
             on="repertoire_id",
             how="left",
         )

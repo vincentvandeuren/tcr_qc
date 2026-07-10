@@ -15,6 +15,7 @@ def compute_metrics(lf: pl.LazyFrame) -> pl.DataFrame:
 
     result = (
         lf
+        .sort("duplicate_count", descending=True)
         .select(pl.col("duplicate_count").cast(pl.Float64).alias("c"))
         .select(
             pl.len().cast(pl.Float64).alias("observed"),
@@ -113,14 +114,10 @@ class DiversityReport(BaseOperation):
 
 
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-
-        diversity_summ = []
-        for rep_id, rep in ds.iter_repertoires(locus=locus, filter_pass_only=True, progress_bar=True, progress_desc="Computing diversity metrics"):
-            m = compute_metrics(rep).with_columns(pl.lit(rep_id).alias("repertoire_id"))
-            diversity_summ.append(m)
-
-        diversity_summ = pl.concat(diversity_summ)
-
+        diversity_summ = ds.map_repertoires(
+            compute_metrics, locus=locus, filter_pass_only=True,
+            progress_bar=True, progress_desc="Computing diversity metrics",
+        )
         return OperationResults(outputs={
             "diversity_summary": diversity_summ,
         })

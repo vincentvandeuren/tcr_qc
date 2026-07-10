@@ -10,7 +10,7 @@ import polars as pl
 from tcr_io import TcrDataset
 from tcr_io.structure import (
     Layout, REQUIRED_DIRS, GENERATED_DIRS, Manifest, operation_relpath,
-    repertoire_relpath, repertoire_meta_relpath,
+    repertoire_locus_relpath, repertoire_meta_relpath,
 )
 import tcr_io.structure.schema as S
 from tcr_io.operations import TestNullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ, RarefactionReport
@@ -23,8 +23,9 @@ def _make_dataset() -> Path:
         (d / sub).mkdir(parents=True, exist_ok=True)
 
     reps = ["rep_a", "rep_b"]
-    (d / "processed_repertoires/TRB").mkdir(parents=True, exist_ok=True)   # locus subdir
     for rid in reps:
+        f = d / repertoire_locus_relpath(rid, "TRB")   # {id}/locus=TRB/{id}.parquet
+        f.parent.mkdir(parents=True, exist_ok=True)
         pl.DataFrame({
             "repertoire_id": [rid, rid, rid],
             "junction": ["TGT", "TGC", "TGA"],
@@ -33,7 +34,7 @@ def _make_dataset() -> Path:
             "j_call": ["TRBJ2-1*01", "TRBJ2-1*01", "TRBJ1-1*01"],
             "duplicate_count": [10, 5, 1],
             "filter_pass": [True, True, False],
-        }).cast(S.REPERTOIRE).write_parquet(d / repertoire_relpath(rid, "TRB"))
+        }).cast(S.REPERTOIRE).write_parquet(f)   # locus is the path, not a column
 
     pl.DataFrame({
         "repertoire_id": reps, "source_files": [["a"], ["b"]], "patient_id": ["p1", "p1"],
@@ -47,7 +48,7 @@ def _make_dataset() -> Path:
         {"dataset_name": ["t"], "created_on": [None], "source": ["x"],
          "reader": ["r"], "repertoire_mapper": ["m"], "patient_mapper": ["m"]}
     ).cast(S.GENERATION_META).write_ndjson(d / Layout.generation_meta.path)
-    Manifest.current().write(d / Layout.manifest.path)
+    Manifest.current(present_loci=["TRB"]).write(d / Layout.manifest.path)   # _present_loci reads this
     return d
 
 
@@ -251,6 +252,51 @@ def test_operations_scan():
 def test_operation_relpath_locus_segment():
     assert operation_relpath("op", "out") == "operations/op/out"
     assert operation_relpath("op", "out", "TRB") == "operations/op/TRB/out"
+
+
+def test_map_repertoires_tags_and_concats():
+    ds = _ds()
+    out = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRB")
+    out = out.collect() if isinstance(out, pl.LazyFrame) else out
+    assert set(out["repertoire_id"].to_list()) == {"rep_a", "rep_b"}   # repertoire_id tagged
+    assert out.height == 2 and "n" in out.columns
+
+
+def test_map_repertoires_concat_false_returns_parts():
+    ds = _ds()
+    parts = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRB", concat=False)
+    assert isinstance(parts, list) and len(parts) == 2
+
+
+def test_filtering_report_unassigned_summary():
+    from tcr_io.operations.filtering_report import FilteringReport
+    ds = _ds()
+    # add an _unassigned partition for rep_a: one null v_call, one null j_call
+    f = ds.db_dir / repertoire_locus_relpath("rep_a", "_unassigned")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "repertoire_id": ["rep_a"] * 2, "junction": ["TGA", "TGG"],
+        "v_call": [None, "TRBV2*01"], "junction_aa": ["CASSL", "CASSX"],
+        "j_call": ["TRBJ2-1*01", None], "duplicate_count": [1, 1], "filter_pass": [False, False],
+    }).cast(S.REPERTOIRE).write_parquet(f)
+
+    ds.run_operation(FilteringReport())
+    us = ds.get_operation_result("filtering_report", "unassigned_summary")
+    row = us.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
+    assert (row["n_null_v_call"], row["n_null_j_call"], row["n_unassigned"]) == (1, 1, 2)
+
+
+def test_map_repertoires_empty_needs_schema():
+    ds = _ds()
+    sch = pl.Schema({"repertoire_id": pl.Utf8, "n": pl.UInt32})
+    empty = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRA", schema=sch)  # no TRA reps
+    empty = empty.collect() if isinstance(empty, pl.LazyFrame) else empty
+    assert empty.height == 0 and empty.columns == ["repertoire_id", "n"]
+    try:
+        ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRA")   # empty, no schema -> raise
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":

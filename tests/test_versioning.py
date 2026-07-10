@@ -105,8 +105,9 @@ def test_commit_per_step_resume():
         migrations.REGISTRY.pop(nxt, None)
 
 
-def test_v4_migration_relocates_to_per_locus_layout():
-    """v3->v4 moves flat processed parquets into TRB/ and repertoire.parquet -> TRB.parquet."""
+def test_v4_migration_relocates_to_hive_layout():
+    """v3->v4 moves flat processed parquets into {id}/locus=TRB/{id}.parquet and
+    repertoire.parquet -> TRB.parquet, and records present_loci in the manifest."""
     d = _make_dataset(manifest_version=3)
     pl.DataFrame(
         {"repertoire_id": ["r1"], "junction": ["TGT"], "v_call": ["TRBV2*01"],
@@ -116,11 +117,15 @@ def test_v4_migration_relocates_to_per_locus_layout():
 
     ds = TcrDataset.migrated(d)
     assert ds.version == DATASET_VERSION
-    assert (Path(d) / "processed_repertoires/TRB/r1.parquet").exists()
+    assert (Path(d) / "processed_repertoires/r1/locus=TRB/r1.parquet").exists()
     assert (Path(d) / "meta/repertoire/TRB.parquet").exists()
     assert not (Path(d) / "processed_repertoires/r1.parquet").exists()
     assert not (Path(d) / "meta/repertoire/repertoire.parquet").exists()
-    assert ds._present_loci() == frozenset({"TRB"})
+    assert ds._present_loci() == frozenset({"TRB"})          # from the manifest
+    assert list(Manifest.read(Path(d) / Layout.manifest.path).present_loci) == ["TRB"]
+    # hive read recovers locus from the path even though it's not in the file
+    assert pl.scan_parquet(Path(d) / "processed_repertoires/r1", hive_partitioning=True) \
+             .select("locus").unique().collect()["locus"].to_list() == ["TRB"]
 
 
 if __name__ == "__main__":

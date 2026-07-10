@@ -6,7 +6,7 @@ from pathlib import Path
 import polars as pl
 
 from tcr_io.ingestion import DatasetIngester
-from tcr_io.expressions import partition_by_locus
+from tcr_io.expressions import assign_locus, UNASSIGNED
 from tcr_io.structure import Layout
 
 
@@ -46,28 +46,15 @@ def test_delete_existing_data_ok_without_operations_dir():
 
 def _mixed_locus_frame() -> pl.DataFrame:
     return pl.DataFrame({
-        "repertoire_id": ["s1"] * 5,
-        "junction": ["tgt"] * 5, "junction_aa": ["CASS"] * 5,
-        "v_call": ["TRBV2*01", "TRBV5-1*01", "TRAV1-1*01", "TRAV1-2*01", "XXYV9*01"],
-        "j_call": ["TRBJ2-1*01", "TRBJ2-7*01", "TRAJ1*01", "TRAJ2*01", "XXYJ1*01"],
-        "duplicate_count": [3, 10, 5, 1, 7],
-        "filter_pass": [True] * 5,
+        "v_call": ["TRBV2*01", "TRAV1-1*01", "XXYV9*01", "TRBV5*01", None],
+        "j_call": ["TRBJ2-1*01", "TRAJ1*01", "XXYJ1*01", "TRAJ2*01", "TRBJ1-1*01"],
     })
 
 
-def test_partition_by_locus_splits_sorts_and_drops_unknown():
-    parts = partition_by_locus(_mixed_locus_frame())
-    # TRA + TRB only; the "XX" prefix is outside KNOWN_LOCI and is dropped.
-    assert sorted(parts) == ["TRA", "TRB"]
-    assert parts["TRB"]["duplicate_count"].to_list() == [10, 3]        # sorted desc
-    assert parts["TRA"]["duplicate_count"].to_list() == [5, 1]
-    assert "locus" not in parts["TRB"].columns                          # transient col dropped
-
-
-def test_partition_by_locus_is_lazy_safe():
-    parts = partition_by_locus(_mixed_locus_frame().lazy())
-    assert all(isinstance(p, pl.LazyFrame) for p in parts.values())     # kind preserved
-    assert parts["TRB"].collect()["duplicate_count"].to_list() == [10, 3]
+def test_assign_locus_maps_known_and_unassigned():
+    out = _mixed_locus_frame().with_columns(assign_locus())["locus"].to_list()
+    # TRB, TRA are known; "XX" prefix is unknown; TRB/TRA prefix mismatch; null v_call -> all _unassigned
+    assert out == ["TRB", "TRA", UNASSIGNED, UNASSIGNED, UNASSIGNED]
 
 
 if __name__ == "__main__":

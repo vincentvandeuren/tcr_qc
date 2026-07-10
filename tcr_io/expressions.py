@@ -8,6 +8,12 @@ from ._rust_expressions import _map_gene_alias, _trim_nucleotide_to_cdr3, _is_fu
 # supports it. A 3-char gene-call prefix outside this set is treated as "no known locus".
 KNOWN_LOCI: frozenset = frozenset({"TRA", "TRB", "TRG", "TRD", "IGH", "IGK", "IGL"})
 
+# Sentinel locus value for rows whose locus can't be derived (null/invalid v_call or j_call, or a
+# prefix outside KNOWN_LOCI). It is a real `locus` value so `pl.PartitionBy` writes those rows to a
+# `locus=_unassigned/` partition (instead of polars' __HIVE_DEFAULT_PARTITION__), kept for QC. The
+# leading underscore marks it "not a real locus": `_present_loci` and op fan-out exclude it.
+UNASSIGNED: str = "_unassigned"
+
 def get_filename(
     path_col: pl.Expr = pl.col("path")
 ) -> pl.Expr:
@@ -66,7 +72,7 @@ def extract_genes(
 
 def extract_locus(
         v_call = pl.col("v_call"),
-        j_call = pl.col("j_call")
+        j_call = pl.col("j_call"),
     ) -> pl.Expr:
     v = v_call.str.slice(0, 3)
     j = j_call.str.slice(0, 3)
@@ -80,30 +86,22 @@ def extract_locus(
     )
 
 
-def partition_by_locus(
-        df: Union[pl.DataFrame, pl.LazyFrame],
+
+def assign_locus(
+        v_call = pl.col("v_call"),
+        j_call = pl.col("j_call"),
         keep_loci: frozenset = KNOWN_LOCI,
-    ) -> Dict[str, Union[pl.DataFrame, pl.LazyFrame]]:
-    """Split a repertoire frame into one frame **per locus**, sorted by ``duplicate_count``
-    descending. Returns ``{locus: frame}`` where each frame is the same kind (lazy/eager) as
-    the input, with the transient ``locus`` column dropped.
-
-    Locus is derived from the (canonicalized) gene calls via `extract_locus`; rows whose locus
-    is undefined (V/J prefixes disagree or null) or outside ``keep_loci`` are dropped — a single
-    input file can legitimately carry several loci (10x TRA+TRB, bulk IGH+IGK+IGL), and only
-    recognised loci are materialised. Works for both `DataFrame` and `LazyFrame`.
+    ) -> pl.Expr:
+    """The `locus` column used as the ingest partition key: `extract_locus`, with any row whose
+    locus is null (V/J prefixes disagree or a call is null) or outside ``keep_loci`` mapped to the
+    ``UNASSIGNED`` sentinel. Every row therefore gets a concrete partition value, so
+    `pl.PartitionBy(key=["locus"])` never falls back to __HIVE_DEFAULT_PARTITION__ and stray
+    prefixes never create rogue `locus=<x>/` dirs — they all funnel into `locus=_unassigned/`.
     """
-    lazy = isinstance(df, pl.LazyFrame)
-    tagged = df.with_columns(extract_locus()).filter(pl.col("locus").is_in(list(keep_loci)))
-
-    loci_col = tagged.select("locus").unique()
-    present = (loci_col.collect() if lazy else loci_col)["locus"].to_list()
-
-    return {
-        locus: (
-            tagged.filter(pl.col("locus") == locus)
-                  .drop("locus")
-                  .sort("duplicate_count", descending=True)
-        )
-        for locus in sorted(present)
-    }
+    locus = extract_locus(v_call, j_call)
+    return (
+        pl.when(locus.is_in(list(keep_loci)))
+        .then(locus)
+        .otherwise(pl.lit(UNASSIGNED))
+        .alias("locus")
+    )

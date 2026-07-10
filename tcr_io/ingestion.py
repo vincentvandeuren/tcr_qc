@@ -11,9 +11,10 @@ import shutil
 
 
 from .dataset import TcrDataset
-from .expressions import partition_by_locus
+from .expressions import assign_locus, UNASSIGNED
 from .structure import (
-    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath, repertoire_meta_relpath, Manifest,
+    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath,
+    loci_glob, repertoire_meta_relpath, Manifest,
     REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
 )
 
@@ -44,7 +45,7 @@ class DatasetIngester:
         publication_ids : List[str] | None = None,
         allow_overwrite: bool = False
     ):
-        self.db_dir = Path(db_dir) / db_name
+        self.db_dir = (Path(db_dir) / db_name).resolve()
         self.reader = reader or ReaderFactory()
         self.repertoire_mapper = repertoire_mapper
         self.patient_mapper = patient_mapper
@@ -102,8 +103,8 @@ class DatasetIngester:
         logger.info("Creating mappings...")
         repertoires, repertoires_to_patients, skipped = self._create_mapping(dir)
         logger.info(f"Mapping created. {len(repertoires)} repertoires mapped from {len(set(repertoires_to_patients.values()))} unique patients, {len(skipped)} files skipped.")
-        self._process_repertoires(repertoires)
-        self._generate_repertoire_metadata(repertoires, repertoires_to_patients)  # writes one meta parquet per locus
+        present_loci = self._process_repertoires(repertoires)   # loci actually written (excl. _unassigned)
+        self._generate_repertoire_metadata(repertoires, repertoires_to_patients, present_loci)
         self._generate_patient_metadata(repertoires_to_patients).write_parquet(
             self.db_dir / Layout.patient_meta.path
         )
@@ -115,27 +116,49 @@ class DatasetIngester:
         )
         # operations/ is created empty by _create_structure (a GENERATED_DIR); ops fill it
         # on demand with per-op operation.json records — there is no global ledger to seed.
-        Manifest.current().write(self.db_dir / Layout.manifest.path)
+        Manifest.current(present_loci=sorted(present_loci)).write(self.db_dir / Layout.manifest.path)
 
         logger.info("Dataset processing complete.")
         return TcrDataset(self.db_dir)
     
-    def _process_repertoires(self, repertoires):
-        # A single input file can carry several loci (10x TRA+TRB, bulk IGH+IGK+IGL), so each
-        # repertoire is split per locus and written under its locus subdir. Locus is the
-        # directory, not a column (see repertoire_relpath).
+    def _process_repertoires(self, repertoires) -> set:
+        """Write each repertoire in a single streaming `pl.PartitionBy` pass, partitioned by locus.
+        A repertoire's frame is derived once (read/dedup/filter) and streamed to
+        ``{id}/locus={LOCUS}/{id}.parquet`` — no collect, no per-locus re-execution. Rows with no
+        derivable locus ride the ``locus=_unassigned/`` partition (see `assign_locus`). Returns the
+        set of real loci written across all repertoires (excluding `_unassigned`)."""
+        present: set = set()
         for repertoire_id, files in tqdm(repertoires.items(), desc="Reading repertoires"):
             df = self.reader.run(files).with_columns(
-                pl.lit(repertoire_id).alias("repertoire_id")
-            )
+                pl.lit(repertoire_id).alias("repertoire_id"),
+                assign_locus(),                          # partition key; unknown/mismatch -> _unassigned
+            ).select([*REPERTOIRE.keys(), "locus"])       # locus is the key only (include_key=False)
 
-            for locus, part in partition_by_locus(df).items():
-                part = part.select(REPERTOIRE.keys()).cast(REPERTOIRE)
-                out = self.db_dir / repertoire_relpath(repertoire_id, locus)
-                out.parent.mkdir(parents=True, exist_ok=True)   # create the locus subdir on first use
-                part.sink_parquet(out)
+            base = self.db_dir / repertoire_dir_relpath(repertoire_id)
+            df.sink_parquet(pl.PartitionBy(
+                str(base), key=["locus"], include_key=False,
+                file_path_provider=self._locus_file_provider(repertoire_id),
+            ))
+            present |= self._loci_written(base)
+        present.discard(UNASSIGNED)
+        return present
 
-    def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients) -> None:
+    def _locus_file_provider(self, repertoire_id):
+        """`file_path_provider` for `PartitionBy`: name each partition's file `{id}.parquet` under
+        its `locus={value}/` hive dir (rather than polars' `00000000.parquet`)."""
+        def provider(args):
+            locus = args.partition_keys.item()          # the single partition value for this file
+            out = self.db_dir / repertoire_locus_relpath(repertoire_id, locus)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            return out
+        return provider
+
+    @staticmethod
+    def _loci_written(base) -> set:
+        """Locus values a repertoire produced, from its `locus=<v>/` partition dirs."""
+        return {p.name.split("=", 1)[1] for p in base.glob("locus=*") if p.is_dir()}
+
+    def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients, present_loci) -> None:
         """Write one `repertoire_meta` parquet per locus (Option C). Each keeps the
         `REPERTOIRE_META` schema (one row per repertoire_id present in that locus)."""
         base = pl.DataFrame({
@@ -144,9 +167,7 @@ class DatasetIngester:
             "patient_id" : [repertoires_to_patients[rep_id] for rep_id in repertoires.keys()]
         })
 
-        processed = self.db_dir / Layout.processed_dir.path
-        for locus_dir in sorted(p for p in processed.iterdir() if p.is_dir()):
-            locus = locus_dir.name
+        for locus in sorted(present_loci):   # present_loci already excludes _unassigned
             rep_sizes = [
                 pl.scan_parquet(f).select(
                     pl.first("repertoire_id"),
@@ -156,7 +177,7 @@ class DatasetIngester:
                 ).with_columns(
                     pl.col("n_filtered_clonotypes") - pl.col("n_clonotypes")
                 )
-                for f in locus_dir.glob("*.parquet")
+                for f in self.db_dir.glob(loci_glob(locus))
             ]
             if not rep_sizes:
                 continue

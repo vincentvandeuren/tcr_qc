@@ -175,17 +175,13 @@ class RarefactionReport(BaseOperation):
         # Compute grid once — shared by all samples
         depth_grid = get_fixed_depth_grid(num_points=self.num_points, max_depth=self.max_depth)
 
-        curves = []
-        for rep_id, rep in ds.iter_repertoires(
+        result = ds.map_repertoires(
+            lambda rep: compute_rarefaction_curve(
+                rep, depth_grid=depth_grid, extrapolation=self.extrapolation,
+            ),
             locus=locus, filter_pass_only=True, progress_bar=True,
             progress_desc="Computing rarefaction",
-        ):
-            curve = compute_rarefaction_curve(
-                rep, depth_grid=depth_grid, extrapolation=self.extrapolation,
-            ).with_columns(pl.lit(rep_id).alias("repertoire_id"))
-            curves.append(curve)
-
-        result = pl.concat(curves)
+        )
 
         return OperationResults(outputs={
             "rarefaction_curves": result,

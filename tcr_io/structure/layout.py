@@ -6,10 +6,10 @@ Every well-known path in a dataset is declared once here as an `Artifact` on the
 `LAYOUT["<key>"]`) instead of hardcoding literals, so the structure can no longer
 drift between `dataset.py`, `ingestion.py`, and the operations.
 
-Per-repertoire files can't be enumerated (one per repertoire), so they get a path
-*builder* (`repertoire_relpath`) rather than a static `Artifact`. The builder is the
-single place the BCR locus split adds a `{LOCUS}/` segment, and where single-cell adds
-`clone_to_cell` — see docs/dataset_versioning_plan.md and the BCR / single-cell plans.
+Per-repertoire files can't be enumerated (one dir per repertoire, hive-partitioned by locus),
+so they get path *builders* (`repertoire_dir_relpath` / `repertoire_locus_relpath`) rather than
+static `Artifact`s. Those builders are the single place the `{id}/locus={LOCUS}/` layout is
+constructed — see docs/per_repertoire_hive_layout_plan.md.
 
 Operation outputs all live under a single generated root (`Layout.operations_dir.path`);
 the framework roots + suffixes them via `operation_relpath`, so they are not declared here.
@@ -92,19 +92,33 @@ GENERATED_DIRS = [a.path for a in LAYOUT.values() if a.kind is Kind.DIR and a.ro
 
 
 def safe_repertoire_name(repertoire_id: str) -> str:
-    """Filesystem-safe repertoire filename stem."""
+    """Filesystem-safe repertoire filename stem (also the repertoire's directory name)."""
     return repertoire_id.replace("/", "_")
 
 
-def repertoire_relpath(repertoire_id: str, locus: str) -> str:
-    """Relative path of a repertoire's processed parquet, under its locus subdir:
-    ``processed_repertoires/{LOCUS}/{repertoire_id}.parquet``.
-
-    Locus is the directory segment (not a column in the parquet); this builder is the single
-    place that layout is constructed, so write (ingestion) and read (iteration, migration)
-    sites cannot drift.
+def repertoire_dir_relpath(repertoire_id: str) -> str:
+    """A repertoire's directory — the `pl.PartitionBy` base:
+    ``processed_repertoires/{repertoire_id}/``. Locus partitions (``locus={LOCUS}/``) live under it.
     """
-    return f"{Layout.processed_dir.path}/{locus}/{safe_repertoire_name(repertoire_id)}.parquet"
+    return f"{Layout.processed_dir.path}/{safe_repertoire_name(repertoire_id)}"
+
+
+def repertoire_locus_relpath(repertoire_id: str, locus: str) -> str:
+    """A repertoire's parquet for one locus (hive-partitioned):
+    ``processed_repertoires/{repertoire_id}/locus={LOCUS}/{repertoire_id}.parquet``.
+
+    Single place the leaf layout is constructed — the ingest `file_path_provider`, per-locus reads,
+    and the migration all resolve through here so they cannot drift. `locus` is encoded only in the
+    path (``include_key=False``), recovered on read via ``hive_partitioning=True``.
+    """
+    safe = safe_repertoire_name(repertoire_id)
+    return f"{Layout.processed_dir.path}/{safe}/locus={locus}/{safe}.parquet"
+
+
+def loci_glob(locus: str = "*") -> str:
+    """Glob for a locus across **all** repertoires: ``processed_repertoires/*/locus={LOCUS}/*.parquet``
+    (``locus='*'`` matches every partition). Used by the op fan-out (`iter_repertoires(locus=L)`)."""
+    return f"{Layout.processed_dir.path}/*/locus={locus}/*.parquet"
 
 
 def repertoire_meta_relpath(locus: str) -> str:
@@ -119,7 +133,7 @@ def repertoire_meta_relpath(locus: str) -> str:
 def operation_relpath(op_name: str, output: str, locus: Optional[str] = None) -> str:
     """Relative path of one operation output within a dataset.
 
-    Mirrors `repertoire_relpath`; the **only** place a locus segment is added to an
+    Mirrors `repertoire_locus_relpath`; the **only** place a locus segment is added to an
     operation output. Ops name their outputs (e.g. ``"gene_counts"``); the framework roots
     them under ``operations/<op>/`` and (for locus-aware ops) inserts a ``<LOCUS>/`` segment.
     The file extension is chosen from the output's `Kind` at write time, not here.
@@ -150,8 +164,8 @@ def render_tree(root_name: str = "dataset", examples: bool = True) -> str:
     tree: dict = {}
     entries = [(a.path, a) for a in LAYOUT.values()]
     if examples:
-        entries.append((repertoire_relpath("sample_001", "TRB"), None))  # illustrative leaf
-        entries.append((repertoire_meta_relpath("TRB"), None))           # per-locus meta leaf
+        entries.append((repertoire_locus_relpath("sample_001", "TRB"), None))  # illustrative leaf
+        entries.append((repertoire_meta_relpath("TRB"), None))                 # per-locus meta leaf
 
     for path, art in entries:
         node = tree

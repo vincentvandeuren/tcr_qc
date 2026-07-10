@@ -21,31 +21,31 @@ class ECOClusterHits(BaseOperation):
         self.eco_df = pl.read_parquet(path).lazy()
 
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        
-        eco_matches = []
 
-        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc="Matching repertoires to CMV ecocluster"):
-            eco_m = df.with_columns(
+        def eco_hits(df):
+            # repertoire_id is tagged by map_repertoires; per-rep aggregate is one row.
+            return df.with_columns(
                 *extract_genes()
             ).join(
                 self.eco_df,
                 on=["v_gene", "j_gene", "junction_aa"],
                 how="inner"
             ).select(
-                pl.lit(repertoire_id).alias("repertoire_id"),
                 pl.sum("duplicate_count").alias("total_cmv_duplicates"),
                 pl.median("duplicate_count").alias("median_duplicates").fill_null(0),
                 pl.mean("duplicate_count").alias("mean_duplicates").fill_null(0),
                 pl.len().alias("n_hits"),
                 pl.n_unique("eco_id").alias("n_unique_ecoclusters"),
                 pl.col("hla_cocluster").n_unique().alias("n_unique_hla_coclusters"),
-            ).collect()
+            )
 
-            eco_matches.append(eco_m)
-
+        eco_matches = ds.map_repertoires(
+            eco_hits, locus=locus, progress_bar=True,
+            progress_desc="Matching repertoires to CMV ecocluster",
+        )   # eager: per-rep collect inside the helper
 
         eco_matches = ds.repertoire_meta(locus).select("repertoire_id", "n_clonotypes", "total_duplicates").join(
-            pl.concat(eco_matches),
+            eco_matches,
             on="repertoire_id",
             how="left"
         ).with_columns(

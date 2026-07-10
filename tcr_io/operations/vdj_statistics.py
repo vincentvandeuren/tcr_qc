@@ -73,14 +73,10 @@ class VdjStatisticsSummary(BaseOperation):
 
 
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-
-        vdj_stat_summ = []
-        for rep_id, rep in ds.iter_repertoires(locus=locus, filter_pass_only=True, progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics"):
-            m = determine_trim_features(rep).with_columns(pl.lit(rep_id).alias("repertoire_id")).collect()
-            vdj_stat_summ.append(m)
-
-        vdj_stat_summ = pl.concat(vdj_stat_summ)
-
+        vdj_stat_summ = ds.map_repertoires(
+            determine_trim_features, locus=locus, filter_pass_only=True,
+            progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics",
+        )
         return OperationResults(outputs={
             "vdj_statistics_summary": vdj_stat_summ,
         })
