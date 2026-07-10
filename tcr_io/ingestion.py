@@ -59,7 +59,7 @@ class DatasetIngester:
                 )
             else:
                 logger.warning(f"Dataset directory {self.db_dir} already exists and will be overwritten.")
-                self._delete_existing_data() # only remove processed_repertoires at this point
+                self._delete_existing_data() # clears processed_repertoires + stale operation outputs
 
         for subdir in REQUIRED_DIRS + GENERATED_DIRS:
             (self.db_dir / subdir).mkdir(parents=True, exist_ok=True)
@@ -200,7 +200,17 @@ class DatasetIngester:
         return df.select(GENERATION_META.keys()).cast(GENERATION_META)
     
     def _delete_existing_data(self):
+        # Re-ingesting the source data makes every derived operation output stale (its inputs
+        # may have changed), so clear operations/ alongside processed_repertoires. Both are
+        # recreated empty by _create_structure; ops recompute on demand into the fresh dir.
         shutil.rmtree(self.db_dir / Layout.processed_dir.path)
+        ops_dir = self.db_dir / Layout.operations_dir.path
+        if ops_dir.exists():
+            shutil.rmtree(ops_dir)
+            logger.warning(
+                "Cleared existing operation results (operations/) — inputs changed on "
+                "re-ingestion; rerun operations to regenerate."
+            )
         
     def _test_mappers(self, dir:Path|str):
         dir : List[Path] = _process_path_wildcards(dir)
