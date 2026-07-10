@@ -177,7 +177,7 @@ class RarefactionReport(BaseOperation):
 
         curves = []
         for rep_id, rep in ds.iter_repertoires(
-            filter_pass_only=True, progress_bar=True,
+            locus=locus, filter_pass_only=True, progress_bar=True,
             progress_desc="Computing rarefaction",
         ):
             curve = compute_rarefaction_curve(

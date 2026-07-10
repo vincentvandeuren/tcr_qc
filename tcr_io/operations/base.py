@@ -129,7 +129,7 @@ class TestNullOperation(BaseOperation):
     description = "Test operation that creates some empty output"
 
     def _run(self, ds: "TcrDataset", locus: Optional[str] = None) -> OperationResults:
-        filter_pass = ds.repertoire_meta.with_columns(
+        filter_pass = ds.repertoire_meta(locus).with_columns(
             filter_pass_pct=pl.col("n_clonotypes") / pl.col("n_clonotypes").add(pl.col("n_filtered_clonotypes"))
         ).select(["repertoire_id", "filter_pass_pct"])
 

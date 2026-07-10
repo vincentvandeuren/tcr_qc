@@ -83,7 +83,7 @@ class BaseHits(BaseOperation, ABC):
         name = self.result_name_short
 
         ms = []
-        for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc=f"Counting {name} hits in repertoires"):
+        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc=f"Counting {name} hits in repertoires"):
             repertoire_lf = df.with_columns(
                 *extract_genes()
             )
@@ -147,7 +147,7 @@ class BaseHits(BaseOperation, ABC):
 
             ms.append(m)
 
-        hits_df = ds.repertoire_meta.select(["repertoire_id"]).join(
+        hits_df = ds.repertoire_meta(locus).select(["repertoire_id"]).join(
             pl.concat(ms),
             on="repertoire_id",
             how="left",

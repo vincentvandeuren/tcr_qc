@@ -56,7 +56,7 @@ class Artifact:
 
 
 class Layout:
-    """Declarative dataset structure. Access as `Layout.repertoire_meta.path`."""
+    """Declarative dataset structure. Access as `Layout.patient_meta.path`."""
     _registry: dict[str, Artifact] = {}
 
     # --- directories (the skeleton) ---
@@ -72,7 +72,9 @@ class Layout:
 
     # --- core files (written at ingestion; carry schemas) ---
     generation_meta = Artifact("meta/generation.json", Kind.NDJSON, schema=schema.GENERATION_META, description="how/when/source this dataset was built")
-    repertoire_meta = Artifact("meta/repertoire/repertoire.parquet", Kind.PARQUET, schema=schema.REPERTOIRE_META, description="one row per repertoire (ids, counts, source files)")
+    # repertoire_meta is written one parquet per locus (meta/repertoire/{LOCUS}.parquet) — a
+    # parameterised leaf, so it lives in the `repertoire_meta_relpath` builder, not a static
+    # Artifact. Its schema is `schema.REPERTOIRE_META` (the same for every locus).
     patient_meta    = Artifact("meta/patient/patient.parquet", Kind.PARQUET, schema=schema.PATIENT_META, description="one row per patient")
     publication_ids = Artifact("meta/publication/publication_ids.json", Kind.NDJSON, schema=schema.PUBLICATION_META, description="DOIs / pubmed ids")
 
@@ -94,13 +96,24 @@ def safe_repertoire_name(repertoire_id: str) -> str:
     return repertoire_id.replace("/", "_")
 
 
-def repertoire_relpath(repertoire_id: str) -> str:
-    """Relative path of a repertoire's processed parquet.
+def repertoire_relpath(repertoire_id: str, locus: str) -> str:
+    """Relative path of a repertoire's processed parquet, under its locus subdir:
+    ``processed_repertoires/{LOCUS}/{repertoire_id}.parquet``.
 
-    The BCR locus split adds a `locus` parameter + a `{LOCUS}/` segment here later;
-    keeping construction in one place means that becomes a one-line change.
+    Locus is the directory segment (not a column in the parquet); this builder is the single
+    place that layout is constructed, so write (ingestion) and read (iteration, migration)
+    sites cannot drift.
     """
-    return f"{Layout.processed_dir.path}/{safe_repertoire_name(repertoire_id)}.parquet"
+    return f"{Layout.processed_dir.path}/{locus}/{safe_repertoire_name(repertoire_id)}.parquet"
+
+
+def repertoire_meta_relpath(locus: str) -> str:
+    """Relative path of a locus's repertoire-meta parquet: ``meta/repertoire/{LOCUS}.parquet``.
+
+    Option C: one meta table per locus, each carrying the `schema.REPERTOIRE_META` schema
+    (grain unchanged — one row per repertoire_id within a locus).
+    """
+    return f"{Layout.repertoire_meta_dir.path}/{locus}.parquet"
 
 
 def operation_relpath(op_name: str, output: str, locus: Optional[str] = None) -> str:
@@ -137,7 +150,8 @@ def render_tree(root_name: str = "dataset", examples: bool = True) -> str:
     tree: dict = {}
     entries = [(a.path, a) for a in LAYOUT.values()]
     if examples:
-        entries.append((repertoire_relpath("sample_001"), None))  # illustrative leaf
+        entries.append((repertoire_relpath("sample_001", "TRB"), None))  # illustrative leaf
+        entries.append((repertoire_meta_relpath("TRB"), None))           # per-locus meta leaf
 
     for path, art in entries:
         node = tree

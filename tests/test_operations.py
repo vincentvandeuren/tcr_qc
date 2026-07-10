@@ -10,9 +10,10 @@ import polars as pl
 from tcr_io import TcrDataset
 from tcr_io.structure import (
     Layout, REQUIRED_DIRS, GENERATED_DIRS, Manifest, operation_relpath,
+    repertoire_relpath, repertoire_meta_relpath,
 )
 import tcr_io.structure.schema as S
-from tcr_io.operations import TestNullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ
+from tcr_io.operations import TestNullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ, RarefactionReport
 from tcr_io.operations.base import BaseOperation, OperationResults
 
 
@@ -22,6 +23,7 @@ def _make_dataset() -> Path:
         (d / sub).mkdir(parents=True, exist_ok=True)
 
     reps = ["rep_a", "rep_b"]
+    (d / "processed_repertoires/TRB").mkdir(parents=True, exist_ok=True)   # locus subdir
     for rid in reps:
         pl.DataFrame({
             "repertoire_id": [rid, rid, rid],
@@ -31,12 +33,12 @@ def _make_dataset() -> Path:
             "j_call": ["TRBJ2-1*01", "TRBJ2-1*01", "TRBJ1-1*01"],
             "duplicate_count": [10, 5, 1],
             "filter_pass": [True, True, False],
-        }).cast(S.REPERTOIRE).write_parquet(d / f"processed_repertoires/{rid}.parquet")
+        }).cast(S.REPERTOIRE).write_parquet(d / repertoire_relpath(rid, "TRB"))
 
     pl.DataFrame({
         "repertoire_id": reps, "source_files": [["a"], ["b"]], "patient_id": ["p1", "p1"],
         "n_clonotypes": [2, 2], "n_filtered_clonotypes": [3, 3], "total_duplicates": [16, 16],
-    }).cast(S.REPERTOIRE_META).write_parquet(d / Layout.repertoire_meta.path)
+    }).cast(S.REPERTOIRE_META).write_parquet(d / repertoire_meta_relpath("TRB"))
     pl.DataFrame({
         "patient_id": ["p1"], "patient_repertoires": [reps], "n_repertoires": [2],
     }).cast(S.PATIENT_META).write_parquet(d / Layout.patient_meta.path)
@@ -135,7 +137,7 @@ class _UnstructuredProbe(BaseOperation):
         (d / "a.txt").write_text("hello")
         (d / "sub").mkdir()
         (d / "sub" / "b.txt").write_text("world")
-        return OperationResults(outputs={"summary": ds.repertoire_meta.select("repertoire_id")})
+        return OperationResults(outputs={"summary": ds.repertoire_meta(locus).select("repertoire_id")})
 
 
 def test_unstructured_write_record_and_mixed_outputs():
@@ -224,6 +226,19 @@ def test_operation_results_ipython_completion():
 
     assert "diversity_report" in names("ds.operation_results.")                     # L1: ops
     assert {"TRB", "diversity_summary"} <= names("ds.operation_results.diversity_report.")  # L2
+
+
+def test_rarefaction_report():
+    ds = _ds()
+    ds.run_operation(RarefactionReport(num_points=30, max_depth=1000))
+    rec = ds._read_operation_record("rarefaction_report")
+    assert rec.loci == ["TRB"]
+    assert rec.params == {"num_points": 30, "max_depth": 1000, "extrapolation": True}   # dataclass config
+    o = rec.outputs[0]
+    assert o.name == "rarefaction_curves" and o.path == "TRB/rarefaction_curves.parquet"
+    df = ds.get_operation_result("rarefaction_report", "rarefaction_curves", "TRB")
+    assert {"subsampling_depth", "expected_richness", "type", "repertoire_id"} <= set(df.columns)
+    assert set(df["repertoire_id"].unique().to_list()) == {"rep_a", "rep_b"}
 
 
 def test_operations_scan():

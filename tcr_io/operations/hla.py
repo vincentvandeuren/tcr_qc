@@ -24,7 +24,7 @@ class BaseHlaInferenceOperation(BaseOperation, ABC):
     description = "Base operation for TCR2HLA inference - does nothing"
     # TRB-intrinsic model -> one locus-agnostic pass; the op filters to TRB internally and
     # its outputs carry no <LOCUS>/ segment (see operations_restructure_phased_plan §3 wrinkle).
-    supported_loci = None
+    supported_loci = frozenset({"TRB"})   # TCR2HLA model is TRB-specific
 
     model_checkpoint: Optional[str] = None
 
@@ -54,7 +54,7 @@ class HlaInference(BaseHlaInferenceOperation):
         )
 
         dfs = []
-        for patient_id, df in ds.iter_repertoires_by_patient(progress_bar=True, progress_desc="Inferring HLA for patients"):
+        for patient_id, df in ds.iter_repertoires_by_patient(locus=locus, progress_bar=True, progress_desc="Inferring HLA for patients"):
             df = df.filter(
                 extract_locus() == "TRB"
             )
@@ -112,7 +112,7 @@ class RepertoireHlaInference(BaseHlaInferenceOperation):
         )
 
         dfs = []
-        for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Inferring HLA for repertoires"):
+        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc="Inferring HLA for repertoires"):
             df = df.filter(
                 extract_locus() == "TRB"
             )

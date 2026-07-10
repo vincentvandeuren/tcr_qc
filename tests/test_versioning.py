@@ -17,7 +17,8 @@ def _make_dataset(manifest_version=None) -> Path:
     d = Path(tempfile.mkdtemp()) / "ds"
     for sub in REQUIRED_DIRS + GENERATED_DIRS:
         (d / sub).mkdir(parents=True, exist_ok=True)
-    pl.DataFrame(schema=S.REPERTOIRE_META).write_parquet(d / Layout.repertoire_meta.path)
+    # Pre-v4 flat meta location; the v4 migration relocates it to meta/repertoire/TRB.parquet.
+    pl.DataFrame(schema=S.REPERTOIRE_META).write_parquet(d / "meta/repertoire/repertoire.parquet")
     pl.DataFrame(schema=S.PATIENT_META).write_parquet(d / Layout.patient_meta.path)
     pl.DataFrame({"publication_id": []}, schema=S.PUBLICATION_META).write_ndjson(d / Layout.publication_ids.path)
     pl.DataFrame(
@@ -102,6 +103,24 @@ def test_commit_per_step_resume():
         assert ds.version == nxt and applied == [1]
     finally:
         migrations.REGISTRY.pop(nxt, None)
+
+
+def test_v4_migration_relocates_to_per_locus_layout():
+    """v3->v4 moves flat processed parquets into TRB/ and repertoire.parquet -> TRB.parquet."""
+    d = _make_dataset(manifest_version=3)
+    pl.DataFrame(
+        {"repertoire_id": ["r1"], "junction": ["TGT"], "v_call": ["TRBV2*01"],
+         "junction_aa": ["CASSF"], "j_call": ["TRBJ2-1*01"], "duplicate_count": [3],
+         "filter_pass": [True]}
+    ).cast(S.REPERTOIRE).write_parquet(Path(d) / "processed_repertoires/r1.parquet")
+
+    ds = TcrDataset.migrated(d)
+    assert ds.version == DATASET_VERSION
+    assert (Path(d) / "processed_repertoires/TRB/r1.parquet").exists()
+    assert (Path(d) / "meta/repertoire/TRB.parquet").exists()
+    assert not (Path(d) / "processed_repertoires/r1.parquet").exists()
+    assert not (Path(d) / "meta/repertoire/repertoire.parquet").exists()
+    assert ds._present_loci() == frozenset({"TRB"})
 
 
 if __name__ == "__main__":

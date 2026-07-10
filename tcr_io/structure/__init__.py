@@ -23,6 +23,7 @@ from .layout import (
     REQUIRED_DIRS,
     GENERATED_DIRS,
     repertoire_relpath,
+    repertoire_meta_relpath,
     operation_relpath,
     safe_repertoire_name,
     render_tree,
@@ -36,7 +37,7 @@ __all__ = [
     "PUBLICATION_META",
     "Artifact", "Kind", "Role", "Layout", "LAYOUT",
     "REQUIRED_DIRS", "GENERATED_DIRS",
-    "repertoire_relpath", "operation_relpath", "safe_repertoire_name", "render_tree",
+    "repertoire_relpath", "repertoire_meta_relpath", "operation_relpath", "safe_repertoire_name", "render_tree",
     "write_artifact",
     "DATASET_VERSION", "Manifest",
 ]

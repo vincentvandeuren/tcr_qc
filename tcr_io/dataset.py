@@ -6,15 +6,19 @@ The authoritative, machine-readable definition of this layout lives in `tcr_io/l
 `Layout.<key>.path`, never by hardcoding these strings.
 
 my_dataset/
-├── processed_repertoires/      # One parquet per repertoire. Atomic unit.
-│   ├── sample_001.parquet      # Standardized schema, repertoire_id column
-│   └── sample_002.parquet
+├── processed_repertoires/      # One parquet per (repertoire, locus). Atomic unit.
+│   ├── TRB/                     # Locus is the directory segment (not a column).
+│   │   ├── sample_001.parquet   # Standardized schema, repertoire_id column
+│   │   └── sample_002.parquet
+│   └── TRA/
+│       └── sample_001.parquet
 │
 ├── meta/                       # Canonical dataset tables ONLY (no op outputs).
 │   ├── generation.json # One row per dataset generation. Metadata about when, how, source, etc.
 │   ├── repertoire/
-│   │   ├── repertoire.parquet  # One row per repertoire. IDs, counts, source files, patient_ids.
-│   │   └── repertoire_meta.parquet # Optional, additional metadata about repertoires (e.g. source, processing notes). Must have repertoire_id column to join with repertoire.parquet.
+│   │   ├── TRB.parquet         # One row per repertoire in this locus. IDs, counts, source files, patient_ids.
+│   │   ├── TRA.parquet         # One meta table per present locus (Option C).
+│   │   └── repertoire_meta.parquet # Optional, additional metadata about repertoires (e.g. source, processing notes). Must have repertoire_id column to join.
 │   ├── patient/
 │   │   ├── patient.parquet     # One row per patient. Aggregated stats.
 │   │   ├── patient_meta.parquet     # Optional, additional metadata about patients (e.g. clinical notes). Must have patient_id column to join with patient.parquet.
@@ -52,9 +56,10 @@ from .operations.base import (
 from .operations import BaseOperation
 from .grouper import Grouper
 from .structure import (
-    Layout, REQUIRED_DIRS, repertoire_relpath, operation_relpath, write_artifact,
-    Artifact, Kind, Role, Manifest, DATASET_VERSION,
+    Layout, REQUIRED_DIRS, repertoire_relpath, repertoire_meta_relpath, operation_relpath,
+    write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION,
 )
+from .structure import schema as _schema
 
 log = logging.getLogger(__name__)
 
@@ -183,9 +188,13 @@ class TcrDataset:
         self.__dict__.pop("_manifest", None)   # invalidate cached_property -> version re-reads
             
     def _present_loci(self) -> frozenset:
-        """Loci actually present in the dataset. Today a dataset is TRB-only; BCR ingestion
-        widens this (phased plan Phase 5), at which point the locus loop below fans out."""
-        return frozenset({"TRB"})
+        """Loci actually present in the dataset, read from the ``processed_repertoires/<LOCUS>/``
+        subdirectories (locus is the directory segment, not a column). Drives the per-locus
+        fan-out in `run_operation`."""
+        processed = self.db_dir / Layout.processed_dir.path
+        if not processed.exists():
+            return frozenset()
+        return frozenset(p.name for p in processed.iterdir() if p.is_dir())
 
     def run_operation(self, operation: BaseOperation, *, force: bool = False):
         """Run an operation across the loci it supports, writing name-keyed outputs under
@@ -362,18 +371,18 @@ class TcrDataset:
     def repertoire_dir(self) -> Path:
         return self.db_dir / Layout.processed_dir.path
 
-    @property
-    def repertoire_meta(self) -> pl.DataFrame:
-        art = Layout.repertoire_meta
-        return (
-            pl.read_parquet(self.db_dir / art.path)
-            .select(art.schema.keys())
-            .cast(art.schema)
-        )
+    def repertoire_meta(self, locus: Optional[str] = None) -> pl.DataFrame:
+        """Per-locus repertoire metadata (Option C). ``locus=None`` returns the concatenation
+        of every present locus (grain: one row per ``(repertoire_id, locus)``); a specific
+        ``locus`` returns just that locus's table (one row per ``repertoire_id``). Callable, not
+        a property, because a multi-locus dataset has no single default table."""
+        loci = sorted(self._present_loci()) if locus is None else [locus]
+        frames = [pl.read_parquet(self.db_dir / repertoire_meta_relpath(l)) for l in loci]
+        df = frames[0] if len(frames) == 1 else pl.concat(frames)
+        return df.select(_schema.REPERTOIRE_META.keys()).cast(_schema.REPERTOIRE_META)
 
-    @property
-    def full_repertoire_meta(self) -> pl.DataFrame:
-        rep = self.repertoire_meta
+    def full_repertoire_meta(self, locus: Optional[str] = None) -> pl.DataFrame:
+        rep = self.repertoire_meta(locus)
 
         extra = self.db_dir / Layout.repertoire_meta_extra.path
         if extra.exists():
@@ -438,12 +447,22 @@ class TcrDataset:
                 records.append(OperationRecord.from_dict(json.loads(op_json.read_text())))
         return records
 
-    def iter_repertoires(self, lazy=True, progress_bar=False, filter_pass_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
+    def _repertoire_files(self, locus: Optional[str] = None) -> List[Path]:
+        """Processed parquet paths, from the ``<LOCUS>/`` subdirs. ``locus=None`` -> all present
+        loci; a specific locus -> only that subdir. The iterator owns locus filtering (E2)."""
+        loci = sorted(self._present_loci()) if locus is None else [locus]
+        files = []
+        for l in loci:
+            files.extend(sorted((self.repertoire_dir / l).glob("*.parquet")))
+        return files
+
+    def iter_repertoires(self, locus:Optional[str]=None, lazy=True, progress_bar=False, filter_pass_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
+        files = self._repertoire_files(locus)
         if progress_bar:
             desc = progress_desc or "Iterating repertoires"
-            progress = tqdm(total=self.n_repertoires, desc=desc)
+            progress = tqdm(total=len(files), desc=desc)
 
-        for parquet_file in self.repertoire_dir.glob("*.parquet"):
+        for parquet_file in files:
             repertoire_id = pl.scan_parquet(parquet_file).select(pl.col("repertoire_id").first()).collect()[0, 0]
             df = pl.scan_parquet(parquet_file)
             if filter_pass_only:
@@ -457,6 +476,7 @@ class TcrDataset:
 
     def iter_repertoires_by_patient(
             self,
+            locus:Optional[str]=None,
             deduplicate=True,
             filter_pass_only=True,
             lazy=True,
@@ -469,8 +489,16 @@ class TcrDataset:
             desc = progress_desc or "Iterating repertoires by patient"
             progress = tqdm(total=patient_meta.select(pl.col("patient_id").n_unique())[0, 0], desc=desc)
 
+        loci = sorted(self._present_loci()) if locus is None else [locus]
+
         for patient, patient_repertoires, in self.patient_meta.select("patient_id", "patient_repertoires").iter_rows():
-            files = [self.db_dir / repertoire_relpath(rep_id) for rep_id in patient_repertoires]
+            # Rebuild per-locus paths from the (unchanged) repertoire-id list; a repertoire only
+            # has a file for the loci it actually produced, so keep the ones that exist.
+            files = [
+                self.db_dir / repertoire_relpath(rep_id, l)
+                for rep_id in patient_repertoires for l in loci
+                if (self.db_dir / repertoire_relpath(rep_id, l)).exists()
+            ]
             n_files = len(files)
 
             df = pl.concat([pl.scan_parquet(f).with_columns(file=pl.lit(f.name)) for f in files])
@@ -495,15 +523,17 @@ class TcrDataset:
     
     @cached_property
     def n_repertoires(self):
-        return self.repertoire_meta.select(pl.col("repertoire_id").n_unique())[0, 0]
-    
+        """Number of samples: unique ``repertoire_id`` across all loci (grain unchanged)."""
+        return self.repertoire_meta().select(pl.col("repertoire_id").n_unique())[0, 0]
+
     @cached_property
     def n_patients(self):
         return self.patient_meta.select(pl.col("patient_id").n_unique())[0, 0]
-    
+
     @cached_property
     def n_clonotypes(self):
-        return self.repertoire_meta.select(pl.sum("n_clonotypes"))[0, 0]
+        """Total passing clonotypes summed across every locus."""
+        return self.repertoire_meta().select(pl.sum("n_clonotypes"))[0, 0]
     
     def __repr__(self):
         return f"TcrDataset \'{self.db_name}\', created_on {self.generation_meta['created_on']}, {self.n_clonotypes} clonotypes ({self.n_repertoires} repertoires, {self.n_patients} patients)."

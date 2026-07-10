@@ -11,8 +11,9 @@ import shutil
 
 
 from .dataset import TcrDataset
+from .expressions import partition_by_locus
 from .structure import (
-    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath, Manifest,
+    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath, repertoire_meta_relpath, Manifest,
     REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
 )
 
@@ -102,9 +103,7 @@ class DatasetIngester:
         repertoires, repertoires_to_patients, skipped = self._create_mapping(dir)
         logger.info(f"Mapping created. {len(repertoires)} repertoires mapped from {len(set(repertoires_to_patients.values()))} unique patients, {len(skipped)} files skipped.")
         self._process_repertoires(repertoires)
-        self._generate_repertoire_metadata(repertoires, repertoires_to_patients).write_parquet(
-            self.db_dir / Layout.repertoire_meta.path
-        )
+        self._generate_repertoire_metadata(repertoires, repertoires_to_patients)  # writes one meta parquet per locus
         self._generate_patient_metadata(repertoires_to_patients).write_parquet(
             self.db_dir / Layout.patient_meta.path
         )
@@ -122,48 +121,54 @@ class DatasetIngester:
         return TcrDataset(self.db_dir)
     
     def _process_repertoires(self, repertoires):
-
+        # A single input file can carry several loci (10x TRA+TRB, bulk IGH+IGK+IGL), so each
+        # repertoire is split per locus and written under its locus subdir. Locus is the
+        # directory, not a column (see repertoire_relpath).
         for repertoire_id, files in tqdm(repertoires.items(), desc="Reading repertoires"):
-            df = self.reader.run(files)
-
-            df = df.with_columns(
+            df = self.reader.run(files).with_columns(
                 pl.lit(repertoire_id).alias("repertoire_id")
-            ).select(REPERTOIRE.keys()).cast(REPERTOIRE)
+            )
 
-            df.sink_parquet(self.db_dir / repertoire_relpath(repertoire_id))
+            for locus, part in partition_by_locus(df).items():
+                part = part.select(REPERTOIRE.keys()).cast(REPERTOIRE)
+                out = self.db_dir / repertoire_relpath(repertoire_id, locus)
+                out.parent.mkdir(parents=True, exist_ok=True)   # create the locus subdir on first use
+                part.sink_parquet(out)
 
-    def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients) -> pl.DataFrame:
-
-        df = pl.DataFrame({
-            "repertoire_id": repertoires.keys(),
+    def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients) -> None:
+        """Write one `repertoire_meta` parquet per locus (Option C). Each keeps the
+        `REPERTOIRE_META` schema (one row per repertoire_id present in that locus)."""
+        base = pl.DataFrame({
+            "repertoire_id": list(repertoires.keys()),
             "source_files": [[f.name for f in files] for files in repertoires.values()],
             "patient_id" : [repertoires_to_patients[rep_id] for rep_id in repertoires.keys()]
         })
 
-        rep_sizes = []
+        processed = self.db_dir / Layout.processed_dir.path
+        for locus_dir in sorted(p for p in processed.iterdir() if p.is_dir()):
+            locus = locus_dir.name
+            rep_sizes = [
+                pl.scan_parquet(f).select(
+                    pl.first("repertoire_id"),
+                    pl.sum("filter_pass").alias("n_clonotypes"),
+                    pl.len().alias("n_filtered_clonotypes"),
+                    pl.sum('duplicate_count').alias("total_duplicates")
+                ).with_columns(
+                    pl.col("n_filtered_clonotypes") - pl.col("n_clonotypes")
+                )
+                for f in locus_dir.glob("*.parquet")
+            ]
+            if not rep_sizes:
+                continue
+            rep_sizes = pl.concat(rep_sizes).collect(engine="streaming")
 
-        for f in (self.db_dir / Layout.processed_dir.path).glob("*.parquet"):
-            s = pl.scan_parquet(f).select(
-                pl.first("repertoire_id"),
-                pl.sum("filter_pass").alias("n_clonotypes"),
-                pl.len().alias("n_filtered_clonotypes"),
-                pl.sum('duplicate_count').alias("total_duplicates")
-            ).with_columns(
-                pl.col("n_filtered_clonotypes") - pl.col("n_clonotypes")
-            )
+            # inner join: a repertoire only appears in a locus's meta if it produced that locus.
+            df = base.join(rep_sizes, on="repertoire_id", how="inner").with_columns(
+                pl.col("n_clonotypes").fill_null(0),
+                pl.col("total_duplicates").fill_null(0)
+            ).select(REPERTOIRE_META.keys()).cast(REPERTOIRE_META)
 
-            rep_sizes.append(s)
-
-        rep_sizes = pl.concat(rep_sizes).collect(engine="streaming")
-
-        df = df.join(rep_sizes, on="repertoire_id", how="left").with_columns(
-            pl.col("n_clonotypes").fill_null(0),
-            pl.col("total_duplicates").fill_null(0)
-        )
-
-        df = df.select(REPERTOIRE_META.keys()).cast(REPERTOIRE_META)
-
-        return df
+            df.write_parquet(self.db_dir / repertoire_meta_relpath(locus))
 
     def _generate_patient_metadata(self, repertoires_to_patients):
 

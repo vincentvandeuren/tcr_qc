@@ -24,7 +24,7 @@ class ECOClusterHits(BaseOperation):
         
         eco_matches = []
 
-        for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Matching repertoires to CMV ecocluster"):
+        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc="Matching repertoires to CMV ecocluster"):
             eco_m = df.with_columns(
                 *extract_genes()
             ).join(
@@ -44,7 +44,7 @@ class ECOClusterHits(BaseOperation):
             eco_matches.append(eco_m)
 
 
-        eco_matches = ds.repertoire_meta.select("repertoire_id", "n_clonotypes", "total_duplicates").join(
+        eco_matches = ds.repertoire_meta(locus).select("repertoire_id", "n_clonotypes", "total_duplicates").join(
             pl.concat(eco_matches),
             on="repertoire_id",
             how="left"

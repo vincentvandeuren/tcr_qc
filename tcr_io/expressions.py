@@ -1,7 +1,12 @@
 import polars as pl
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 from ._rust_expressions import _map_gene_alias, _trim_nucleotide_to_cdr3, _is_functional_tcr, _determine_reference_points
+
+# The receptor loci tcrio understands. Phase 1 ships the TR chains; the IG chains are
+# recognised here so BCR data (Phase 2) partitions correctly the moment the reference
+# supports it. A 3-char gene-call prefix outside this set is treated as "no known locus".
+KNOWN_LOCI: frozenset = frozenset({"TRA", "TRB", "TRG", "TRD", "IGH", "IGK", "IGL"})
 
 def get_filename(
     path_col: pl.Expr = pl.col("path")
@@ -73,3 +78,32 @@ def extract_locus(
         .otherwise(None)
         .alias("locus")
     )
+
+
+def partition_by_locus(
+        df: Union[pl.DataFrame, pl.LazyFrame],
+        keep_loci: frozenset = KNOWN_LOCI,
+    ) -> Dict[str, Union[pl.DataFrame, pl.LazyFrame]]:
+    """Split a repertoire frame into one frame **per locus**, sorted by ``duplicate_count``
+    descending. Returns ``{locus: frame}`` where each frame is the same kind (lazy/eager) as
+    the input, with the transient ``locus`` column dropped.
+
+    Locus is derived from the (canonicalized) gene calls via `extract_locus`; rows whose locus
+    is undefined (V/J prefixes disagree or null) or outside ``keep_loci`` are dropped — a single
+    input file can legitimately carry several loci (10x TRA+TRB, bulk IGH+IGK+IGL), and only
+    recognised loci are materialised. Works for both `DataFrame` and `LazyFrame`.
+    """
+    lazy = isinstance(df, pl.LazyFrame)
+    tagged = df.with_columns(extract_locus()).filter(pl.col("locus").is_in(list(keep_loci)))
+
+    loci_col = tagged.select("locus").unique()
+    present = (loci_col.collect() if lazy else loci_col)["locus"].to_list()
+
+    return {
+        locus: (
+            tagged.filter(pl.col("locus") == locus)
+                  .drop("locus")
+                  .sort("duplicate_count", descending=True)
+        )
+        for locus in sorted(present)
+    }

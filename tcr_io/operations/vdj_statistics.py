@@ -67,7 +67,7 @@ def determine_trim_features(df:pl.LazyFrame) -> pl.DataFrame:
 @dataclass
 class VdjStatisticsSummary(BaseOperation):
     name = "vdj_statistics_summary"
-    version = "0.1"
+    version = "0.2"     # v0.2: TRB D-features changed — the Rust D-index no longer pools TRD D-genes into TRB
     description = "Generates a report summarizing inferred likely VDJ trimming and insertion metrics across repertoires."
     supported_loci = ALL_LOCI
 
@@ -75,7 +75,7 @@ class VdjStatisticsSummary(BaseOperation):
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
 
         vdj_stat_summ = []
-        for rep_id, rep in ds.iter_repertoires(filter_pass_only=True, progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics"):
+        for rep_id, rep in ds.iter_repertoires(locus=locus, filter_pass_only=True, progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics"):
             m = determine_trim_features(rep).with_columns(pl.lit(rep_id).alias("repertoire_id")).collect()
             vdj_stat_summ.append(m)
 

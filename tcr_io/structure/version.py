@@ -12,7 +12,9 @@ from pathlib import Path
 
 from .._internal import __version__ as _tcrio_version
 
-DATASET_VERSION = 3   # v3: hive outputs folded into unstructured op-written dirs; temp/ dropped
+DATASET_VERSION = 4   # v4: processed repertoires split into per-locus subdirs (locus = directory);
+                      #     repertoire meta stored one parquet per locus (meta/repertoire/{LOCUS}.parquet)
+                      # v3: hive outputs folded into unstructured op-written dirs; temp/ dropped
                       # v2: all operation outputs live under operations/ (per-op operation.json);
                       # v1 = the pre-restructure layout (scattered op outputs + meta/operations.json)
 

@@ -18,14 +18,17 @@ class GeneCountsSummary(BaseOperation):
     name = "gene_counts_summary"
     version = "0.3"
     description = "Counts the V and J gene usage frequencies, and computes the surprise of their combinations."
-    supported_loci = ALL_LOCI
+    # TRB-only for now: the gene columns are hardcoded TRBV/TRBJ (for cross-repertoire
+    # comparability + missing-gene highlighting). The per-locus functional-gene rewrite lands
+    # in Phase 2, at which point this widens back to ALL_LOCI. See tr_bcr_chain_support plan §2.3.
+    supported_loci = frozenset({"TRB"})
 
 
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         
         vj_table = []
 
-        for repertoire_id, df in ds.iter_repertoires(progress_bar = True, progress_desc="Counting v/j statistics"):
+        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar = True, progress_desc="Counting v/j statistics"):
             vj = df.with_columns(
                 *extract_genes()
             ).group_by(["v_gene", "j_gene"]).agg(pl.len().alias("count")).with_columns(
@@ -90,7 +93,7 @@ class GeneCountsSummary(BaseOperation):
             pl.col(float).fill_null(0).name.prefix("bias_")
         )
 
-        reps = ds.repertoire_meta.select(pl.col("repertoire_id"))
+        reps = ds.repertoire_meta(locus).select(pl.col("repertoire_id"))
         all_broad = reps.join(v_tab, on="repertoire_id", how="left").join(j_tab, on="repertoire_id", how="left").join(vj_surprise_tab, on="repertoire_id", how="left")
 
 

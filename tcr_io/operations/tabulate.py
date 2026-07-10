@@ -12,7 +12,7 @@ class TabulateByVJ(BaseOperation):
     supported_loci = ALL_LOCI
 
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        lf = pl.scan_parquet(ds.repertoire_dir).filter("filter_pass").with_columns(
+        lf = pl.scan_parquet(ds.repertoire_dir / locus).filter("filter_pass").with_columns(
             *extract_genes()
         )
         # Unstructured directory output: the op sinks the hive partitions itself into the

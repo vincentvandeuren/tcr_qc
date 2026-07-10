@@ -23,7 +23,7 @@ class FilteringReport(BaseOperation):
         filter_summ = []
         top_invalid = defaultdict(list)
                 
-        for rep_id, rep in ds.iter_repertoires(filter_pass_only=False, progress_bar=True, progress_desc="Creating filtering summary"):
+        for rep_id, rep in ds.iter_repertoires(locus=locus, filter_pass_only=False, progress_bar=True, progress_desc="Creating filtering summary"):
             filtered = self.filterer.run(
                 rep.filter(pl.col("filter_pass").eq(False)) # only rerun filters on failed rows to save time
             )

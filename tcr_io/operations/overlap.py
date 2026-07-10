@@ -27,7 +27,7 @@ class OverlapAnalyzer(BaseOperation):
 
         head_dir = ds._operation_output_dir(self, "heads", locus)   # managed, recorded output
 
-        for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Collecting heads"):
+        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar=True, progress_desc="Collecting heads"):
             repertoire_id_safe = safe_repertoire_name(repertoire_id)
             df.head(self.top_n).with_columns(
                 *extract_genes()
@@ -70,7 +70,7 @@ class OverlapAnalyzer(BaseOperation):
             pl.corr(pl.col("duplicate_count"), pl.col("duplicate_count_right"), method="spearman").fill_nan(0).alias("spearman_corr"),
         ).collect(engine="streaming")
 
-        o = ds.repertoire_meta.select(["repertoire_id", "patient_id", "n_filtered_clonotypes"]).with_columns(join=pl.lit(True))
+        o = ds.repertoire_meta(locus).select(["repertoire_id", "patient_id", "n_filtered_clonotypes"]).with_columns(join=pl.lit(True))
 
         overlap_table = o.join(o, on="join", how="full").filter(pl.col("repertoire_id") < pl.col("repertoire_id_right")).drop(["join", "join_right"]).join(
             overlap, on=["repertoire_id", "repertoire_id_right"], how="left"
@@ -93,7 +93,7 @@ class OverlapAnalyzer(BaseOperation):
             pl.col("flag_sus_overlap").sum().alias("sus_overlap"),
             pl.col("flag_sus_overlap_absence").sum().alias("sus_overlap_absence")
         ).with_columns(
-            n_repertoires = ds.repertoire_meta.height
+            n_repertoires = ds.repertoire_meta(locus).height
         )
 
         return OperationResults(

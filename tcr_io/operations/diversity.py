@@ -115,7 +115,7 @@ class DiversityReport(BaseOperation):
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
 
         diversity_summ = []
-        for rep_id, rep in ds.iter_repertoires(filter_pass_only=True, progress_bar=True, progress_desc="Computing diversity metrics"):
+        for rep_id, rep in ds.iter_repertoires(locus=locus, filter_pass_only=True, progress_bar=True, progress_desc="Computing diversity metrics"):
             m = compute_metrics(rep).with_columns(pl.lit(rep_id).alias("repertoire_id"))
             diversity_summ.append(m)
 
