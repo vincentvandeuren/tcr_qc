@@ -101,6 +101,7 @@ class TcrDataset:
         self._pending_unstructured: List[OutputRecord] = []
         self._validate_dirs()
         self._check_version()
+        self._refresh_operation_results()
 
     @classmethod
     def migrated(cls, db_dir:str|Path) -> "TcrDataset":
@@ -112,9 +113,11 @@ class TcrDataset:
         ds.db_name = ds.db_dir.name
         if not ds.db_dir.exists():
             raise FileNotFoundError(f"Dataset directory does not exist: {ds.db_dir}")
+        ds._pending_unstructured = []
         ds.migrate()          # brings structure AND version up to current, on a possibly-old tree
         ds._validate_dirs()   # now the tree matches the current layout
         ds._check_version()   # equal -> silent
+        ds._refresh_operation_results()
         return ds
 
     def path(self, artifact) -> Path:
@@ -224,6 +227,7 @@ class TcrDataset:
             operation, status="success", error=None,
             duration_s=time() - start, ran_loci=ran_loci, output_records=output_records,
         )
+        self._refresh_operation_results()   # make the just-run op tab-completable
 
     def _write_output(self, operation: BaseOperation, name: str, result, locus: Optional[str]) -> OutputRecord:
         kind = _output_kind(result)
@@ -334,13 +338,16 @@ class TcrDataset:
             return path          # an op-written directory; the caller reads its files itself
         return _read_output(path, orec.kind)
 
-    @property
-    def operation_results(self) -> "OperationResultsNamespace":
-        """Autocompleting result access: ``ds.operation_results.<op>[.<locus>].<output>``.
+    def _refresh_operation_results(self) -> None:
+        """(Re)build the autocompleting ``operation_results`` namespace as a **plain attribute**.
 
-        Runtime-dynamic (discovers ops/outputs by scanning ``operations/``) so Jupyter/IPython
-        tab-completion works. Layered on `get_operation_result`."""
-        return OperationResultsNamespace(self)
+        It must be a real attribute (not a ``@property``) holding real sub-attributes, because
+        IPython's completer evaluates the access chain through ``guarded_eval``, whose default
+        ``'limited'`` policy rejects ``@property`` getters and ``__getattr__`` — so a dynamic
+        chain never reaches ``__dir__`` and nothing tab-completes. Rebuilt after each
+        `run_operation` so a newly-run op becomes completable. Discovers ops by scanning
+        ``operations/``; layered on `get_operation_result`."""
+        self.operation_results = OperationResultsNamespace(self)
 
     def rerun(self, op_cls: type[BaseOperation], **overrides):
         """Reconstruct an op from its stored params (+ overrides) and re-run it (forced).
@@ -503,20 +510,28 @@ class TcrDataset:
 
 
 class OperationResultsNamespace:
-    """`ds.operation_results` — attribute access to operation outputs, discovered at runtime.
+    """`ds.operation_results` — attribute access to operation outputs.
 
-    ``ds.operation_results.<op>`` -> `OperationHandle`; ``__dir__`` lists ops so notebook
-    tab-completion surfaces them."""
+    Each successful op is set as a **real attribute** (an `OperationHandle`) at construction, so
+    IPython's `guarded_eval` completer can traverse ``ds.operation_results.<op>...`` under its
+    default ``'limited'`` policy (which rejects ``@property``/``__getattr__`` hops). `ds` rebuilds
+    this namespace after each run (`_refresh_operation_results`), so new ops appear. `__getattr__`
+    stays as a fallback for ops written after this namespace was built."""
     def __init__(self, ds: TcrDataset):
         self._ds = ds
+        ops_dir = ds.db_dir / Layout.operations_dir.path
+        if ops_dir.exists():
+            for p in sorted(ops_dir.glob("*/operation.json")):
+                op_name = p.parent.name
+                if op_name.startswith("_"):
+                    continue
+                rec = ds._read_operation_record(op_name)
+                if rec is not None and rec.status == "success":
+                    setattr(self, op_name, OperationHandle(ds, rec))
 
-    def __getattr__(self, op_name: str) -> "OperationHandle":
-        if op_name.startswith("_"):
-            raise AttributeError(op_name)
-        rec = self._ds._read_operation_record(op_name)
-        if rec is None or rec.status != "success":
-            raise AttributeError(f"No successful operation '{op_name}' on this dataset.")
-        return OperationHandle(self._ds, rec)
+    # NB: deliberately NO __getattr__ — its mere presence on the class makes IPython's
+    # guarded_eval refuse to traverse this object during completion (limited mode), so the
+    # chain never reaches `__dir__`. Ops are real attributes (above), refreshed after each run.
 
     def __dir__(self):
         ops_dir = self._ds.db_dir / Layout.operations_dir.path
@@ -525,12 +540,20 @@ class OperationResultsNamespace:
 
 
 class OperationHandle:
-    """One operation's outputs. ``.<output>`` -> the frame; ``.<locus>.<output>`` for
-    locus-aware ops. ``__dir__`` lists outputs (+ loci) for tab-completion."""
+    """One operation's outputs. ``.<output>`` -> the frame (or `Path`); ``.<locus>.<output>`` for
+    locus-aware ops.
+
+    Loci are set as **real attributes** (sub-handles) so `guarded_eval` can traverse them during
+    completion; outputs stay lazy (`__getattr__`) so no frame is loaded just to complete a name
+    (the completer only ``dir()``s this handle, it never evaluates the leaf). ``__dir__`` lists
+    outputs (+ loci) for tab-completion."""
     def __init__(self, ds: TcrDataset, rec: OperationRecord, locus: Optional[str] = None):
         object.__setattr__(self, "_ds", ds)
         object.__setattr__(self, "_rec", rec)
         object.__setattr__(self, "_locus", locus)
+        if locus is None:
+            for loc in self._loci():                      # real sub-handle per locus (completable)
+                object.__setattr__(self, loc, OperationHandle(ds, rec, locus=loc))
 
     def _loci(self) -> List[str]:
         return sorted({o.locus for o in self._rec.outputs if o.locus is not None})

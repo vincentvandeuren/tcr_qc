@@ -189,6 +189,43 @@ def test_unstructured_one_dir_per_op_raises():
     assert ds._read_operation_record("two_dirs").status == "failure"
 
 
+def test_operation_results_are_real_attributes():
+    # Autocomplete depends on the whole `ds.operation_results.<op>[.<locus>]` chain being REAL
+    # attributes (no @property / __getattr__ intermediates), else IPython's guarded_eval refuses
+    # to traverse it during completion. Guard those structural invariants here.
+    from tcr_io.dataset import OperationResultsNamespace
+    assert "__getattr__" not in vars(OperationResultsNamespace)   # presence blocks guarded_eval
+    ds = _ds()
+    ds.run_operation(DiversityReport())
+    assert "operation_results" in vars(ds)                        # plain attr, not a @property
+    ns = ds.operation_results
+    assert "diversity_report" in vars(ns)                         # op handle is a real attribute
+    assert "TRB" in vars(ns.diversity_report)                     # locus sub-handle is real too
+    # refreshed after a new run so it becomes completable immediately
+    ds.run_operation(GeneCountsSummary())
+    assert "gene_counts_summary" in vars(ds.operation_results)
+
+
+def test_operation_results_ipython_completion():
+    try:
+        from IPython.terminal.interactiveshell import TerminalInteractiveShell
+        from IPython.core.completer import provisionalcompleter
+    except ImportError:
+        return                                                    # IPython not installed -> skip
+    ds = _ds()
+    ds.run_operation(DiversityReport())
+    ip = TerminalInteractiveShell.instance()
+    ip.user_ns["ds"] = ds
+    ip.Completer.evaluation = "limited"                           # the notebook default policy
+
+    def names(text):
+        with provisionalcompleter():
+            return {c.text.split(".")[-1].lstrip(".") for c in ip.Completer.completions(text, len(text))}
+
+    assert "diversity_report" in names("ds.operation_results.")                     # L1: ops
+    assert {"TRB", "diversity_summary"} <= names("ds.operation_results.diversity_report.")  # L2
+
+
 def test_operations_scan():
     ds = _ds()
     ds.run_operation(TestNullOperation())
