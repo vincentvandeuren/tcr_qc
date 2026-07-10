@@ -115,12 +115,16 @@ pub static IMGT_REF: LazyLock<HashMap<Organism, HashMap<String, TcrData>>> =
         map
     });
 
+// D-segment reference for TRB, keyed to the TRB locus only. The `chain == TRB` filter is
+// load-bearing: the reference also contains TRD D-genes (TRDD1/2/3), and without it the "TRBD"
+// index pools TRBD + TRDD, so TRB junctions get matched against TRD D-segments — a wrong
+// annotation. `determine_reference_points` only computes D for TRB, so this index is TRB-only.
 pub static IMGT_HUMAN_TRBD: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     IMGT_REF
         .get(&Organism::Human)
         .into_iter()
         .flat_map(|m| m.values())
-        .filter(|t| t.gene_type == TcrGeneType::D)
+        .filter(|t| t.gene_type == TcrGeneType::D && t.chain == TcrChain::TRB)
         .map(|t| t.sequence_nt.as_str())
         .collect()
 });
@@ -130,7 +134,7 @@ pub static IMGT_MOUSE_TRBD: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .get(&Organism::Mouse)
         .into_iter()
         .flat_map(|m| m.values())
-        .filter(|t| t.gene_type == TcrGeneType::D)
+        .filter(|t| t.gene_type == TcrGeneType::D && t.chain == TcrChain::TRB)
         .map(|t| t.sequence_nt.as_str())
         .collect()
 });
