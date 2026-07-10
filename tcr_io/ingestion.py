@@ -13,7 +13,7 @@ import shutil
 from .dataset import TcrDataset
 from .structure import (
     Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_relpath, Manifest,
-    OPERATIONS_META, REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
+    REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
 )
 
 
@@ -114,9 +114,8 @@ class DatasetIngester:
         self._generate_generation_metadata(dir).write_ndjson(
             self.db_dir / Layout.generation_meta.path
         )
-        self._generate_operations_metadata().write_ndjson(
-            self.db_dir / Layout.operations_meta.path
-        )
+        # operations/ is created empty by _create_structure (a GENERATED_DIR); ops fill it
+        # on demand with per-op operation.json records — there is no global ledger to seed.
         Manifest.current().write(self.db_dir / Layout.manifest.path)
 
         logger.info("Dataset processing complete.")
@@ -200,10 +199,6 @@ class DatasetIngester:
         )
         return df.select(GENERATION_META.keys()).cast(GENERATION_META)
     
-    def _generate_operations_metadata(self):
-        df = pl.DataFrame(schema=OPERATIONS_META) #empty dataframe
-        return df.select(OPERATIONS_META.keys()).cast(OPERATIONS_META)
-
     def _delete_existing_data(self):
         shutil.rmtree(self.db_dir / Layout.processed_dir.path)
         

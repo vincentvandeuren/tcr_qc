@@ -19,7 +19,7 @@ def test_render_tree_covers_every_artifact():
 def test_render_tree_marks_optional_and_generated():
     tree = render_tree()
     assert "manifest.json  # optional" in tree
-    assert "tabulated/  # generated" in tree
+    assert "operations/  # generated" in tree
 
 
 def test_render_tree_shows_parameterised_repertoire_example():

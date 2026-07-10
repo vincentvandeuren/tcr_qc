@@ -1,7 +1,8 @@
 # copy code from baseline technical features model
-from .base import BaseOperation, OperationResults
+from .base import ALL_LOCI, BaseOperation, OperationResults
 from ..expressions import _determine_reference_points, extract_genes
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Optional
 import polars as pl
 from itertools import product
 
@@ -12,13 +13,15 @@ VJ_COLS = [f"{v}+{j}" for v, j in product(V_GENES, J_GENES)]
 
 
 
+@dataclass
 class GeneCountsSummary(BaseOperation):
     name = "gene_counts_summary"
     version = "0.3"
     description = "Counts the V and J gene usage frequencies, and computes the surprise of their combinations."
+    supported_loci = ALL_LOCI
 
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         
         vj_table = []
 
@@ -92,9 +95,9 @@ class GeneCountsSummary(BaseOperation):
 
 
         return OperationResults(outputs={
-            "meta/repertoire/gene_counts.parquet": all_broad,
-            "meta/repertoire/v_counts.parquet": v_tab,
-            "meta/repertoire/j_counts.parquet": j_tab,
-            "meta/repertoire/vj_bias.parquet": vj_surprise_tab,
-            "meta/repertoire/vj_long.parquet": vj_long
+            "gene_counts": all_broad,
+            "v_counts": v_tab,
+            "j_counts": j_tab,
+            "vj_bias": vj_surprise_tab,
+            "vj_long": vj_long,
         })

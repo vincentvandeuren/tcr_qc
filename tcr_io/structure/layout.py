@@ -11,8 +11,8 @@ Per-repertoire files can't be enumerated (one per repertoire), so they get a pat
 single place the BCR locus split adds a `{LOCUS}/` segment, and where single-cell adds
 `clone_to_cell` — see docs/dataset_versioning_plan.md and the BCR / single-cell plans.
 
-Operation outputs remain free-form (open-ended), but should reference the well-known
-roots below (`Layout.repertoire_meta_dir.path`, `Layout.qc_dir.path`, ...).
+Operation outputs all live under a single generated root (`Layout.operations_dir.path`);
+the framework roots + suffixes them via `operation_relpath`, so they are not declared here.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -28,6 +28,7 @@ class Kind(Enum):
     PARQUET = "parquet"
     NDJSON = "ndjson"
     JSON = "json"       # single pretty-printed object (e.g. the version manifest)
+    UNSTRUCTURED = "unstructured"   # op-written directory of arbitrary result files
 
 
 class Role(Enum):
@@ -47,7 +48,11 @@ class Artifact:
 
     def __set_name__(self, owner, name):
         object.__setattr__(self, "key", name)      # frozen dataclass -> bypass __setattr__
-        owner._registry[name] = self
+        # Only auto-register on classes that opt in (i.e. Layout). This lets Artifacts be
+        # declared as class attributes on operations, or built at runtime, without polluting
+        # the global LAYOUT registry.
+        if hasattr(owner, "_registry"):
+            owner._registry[name] = self
 
 
 class Layout:
@@ -60,15 +65,13 @@ class Layout:
     repertoire_meta_dir = Artifact("meta/repertoire", Kind.DIR)
     patient_meta_dir    = Artifact("meta/patient", Kind.DIR)
     publication_dir     = Artifact("meta/publication", Kind.DIR)
-    qc_dir              = Artifact("qc", Kind.DIR, description="QC metric tables + plots")
-    tabulated_dir       = Artifact("tabulated", Kind.DIR, role=Role.GENERATED, description="hive-partitioned, rebuildable")
+    operations_dir      = Artifact("operations", Kind.DIR, role=Role.GENERATED, description="all generated operation results")
 
     # --- version manifest (absent on pre-versioning datasets -> optional) ---
     manifest = Artifact("meta/manifest.json", Kind.JSON, role=Role.OPTIONAL, description="dataset version")
 
     # --- core files (written at ingestion; carry schemas) ---
     generation_meta = Artifact("meta/generation.json", Kind.NDJSON, schema=schema.GENERATION_META, description="how/when/source this dataset was built")
-    operations_meta = Artifact("meta/operations.json", Kind.NDJSON, schema=schema.OPERATIONS_META, description="one row per operation run")
     repertoire_meta = Artifact("meta/repertoire/repertoire.parquet", Kind.PARQUET, schema=schema.REPERTOIRE_META, description="one row per repertoire (ids, counts, source files)")
     patient_meta    = Artifact("meta/patient/patient.parquet", Kind.PARQUET, schema=schema.PATIENT_META, description="one row per patient")
     publication_ids = Artifact("meta/publication/publication_ids.json", Kind.NDJSON, schema=schema.PUBLICATION_META, description="DOIs / pubmed ids")
@@ -77,7 +80,6 @@ class Layout:
     repertoire_meta_extra = Artifact("meta/repertoire/repertoire_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-repertoire metadata, joined on repertoire_id")
     patient_meta_extra    = Artifact("meta/patient/patient_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-patient metadata, joined on patient_id")
     hla                   = Artifact("meta/patient/hla.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="known HLA typing")
-    inferred_hla          = Artifact("meta/patient/inferred_hla.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="computationally inferred HLA")
     publication_meta      = Artifact("meta/publication/publication.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="fetched publication metadata cache")
 
 
@@ -99,6 +101,18 @@ def repertoire_relpath(repertoire_id: str) -> str:
     keeping construction in one place means that becomes a one-line change.
     """
     return f"{Layout.processed_dir.path}/{safe_repertoire_name(repertoire_id)}.parquet"
+
+
+def operation_relpath(op_name: str, output: str, locus: Optional[str] = None) -> str:
+    """Relative path of one operation output within a dataset.
+
+    Mirrors `repertoire_relpath`; the **only** place a locus segment is added to an
+    operation output. Ops name their outputs (e.g. ``"gene_counts"``); the framework roots
+    them under ``operations/<op>/`` and (for locus-aware ops) inserts a ``<LOCUS>/`` segment.
+    The file extension is chosen from the output's `Kind` at write time, not here.
+    """
+    parts = [Layout.operations_dir.path, op_name] + ([locus] if locus else []) + [output]
+    return "/".join(parts)
 
 
 def _annotate(art: Optional[Artifact]) -> str:

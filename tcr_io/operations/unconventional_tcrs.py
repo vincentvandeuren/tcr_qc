@@ -4,29 +4,39 @@ from tcr_io.operations.base import BaseOperation, OperationResults
 from tcr_io._resources import resource_path
 from tcr_io.expressions import extract_genes
 import polars as pl
+from dataclasses import dataclass
 from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Optional
 
+@dataclass
 class BaseHits(BaseOperation, ABC):
     name = "base_hits"
     version = "0.0"
     description = "Counts the number of hits for each repertoire."
     result_name_short = "base"
+    supported_loci = frozenset({"TRB"})
 
-    def __init__(self, model_checkpoint: Optional[str | Path] = None):
-        if model_checkpoint is None:
+    model_checkpoint: Optional[str] = None
+
+    def __post_init__(self):
+        ckpt = self.model_checkpoint if self.model_checkpoint is not None else self._default_checkpoint()
+        if ckpt is None:
             raise ValueError(
                 f"{type(self).__name__} requires a model file (not bundled in the beta). "
                 "Pass model_checkpoint=<path-to-parquet>. See README 'Beta limitations'."
             )
-        self.query_df = self._prepare_query_df(Path(model_checkpoint))
+        self.query_df = self._prepare_query_df(Path(ckpt))
+
+    def _default_checkpoint(self) -> Optional[str | Path]:
+        """Bundled reference set, or None if the op ships without one."""
+        return None
 
     @abstractmethod
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
         pass
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         """
         Clonal breadth and depth of disease-specific T-cell response.
         As defined in Snyder et al https://doi.org/10.3389/fimmu.2024.1488860
@@ -143,20 +153,19 @@ class BaseHits(BaseOperation, ABC):
             how="left",
         )
         return OperationResults(outputs={
-            f"meta/repertoire/{self.result_name_short}_hits.parquet": hits_df,
+            f"{self.result_name_short}_hits": hits_df,
         })
 
+@dataclass
 class MaitHits(BaseHits):
     name = "mait_hits"
     version = "0.6"
     description = "Counts the number of mait hits (from unconventional tcr db) for each repertoire."
     result_name_short = "mait"
 
-    def __init__(self, model_checkpoint: Optional[str | Path] = None):
+    def _default_checkpoint(self) -> Optional[str | Path]:
         # The MAIT reference set is bundled; default to it, allow a path override.
-        if model_checkpoint is None:
-            model_checkpoint = resource_path("mait_hits.parquet")
-        super().__init__(model_checkpoint)
+        return resource_path("mait_hits.parquet")
 
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
         return pl.read_parquet(model_checkpoint).select(["v_gene", "j_gene", "junction_aa"]).lazy()

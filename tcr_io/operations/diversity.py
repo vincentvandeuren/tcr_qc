@@ -1,7 +1,9 @@
 import polars as pl
 import numpy as np
+from dataclasses import dataclass
+from typing import Optional
 from scipy.special import binom
-from .base import BaseOperation, OperationResults
+from .base import ALL_LOCI, BaseOperation, OperationResults
 
 def compute_metrics(lf: pl.LazyFrame) -> pl.DataFrame:
     """
@@ -102,21 +104,23 @@ def _efron_thisted(nx: np.ndarray, observed: float) -> float:
     return float(S) if not np.isnan(float(S)) else 0.0
 
 
+@dataclass
 class DiversityReport(BaseOperation):
     name = "diversity_report"
     version = "0.1"
     description = "Generates a report summarizing diversity metrics across repertoires."
+    supported_loci = ALL_LOCI
 
 
-    def _run(self, ds) -> OperationResults:
-        
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
+
         diversity_summ = []
         for rep_id, rep in ds.iter_repertoires(filter_pass_only=True, progress_bar=True, progress_desc="Computing diversity metrics"):
             m = compute_metrics(rep).with_columns(pl.lit(rep_id).alias("repertoire_id"))
             diversity_summ.append(m)
 
         diversity_summ = pl.concat(diversity_summ)
-        
+
         return OperationResults(outputs={
-            "meta/repertoire/diversity_summary.parquet": diversity_summ,
+            "diversity_summary": diversity_summ,
         })

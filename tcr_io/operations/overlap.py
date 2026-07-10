@@ -1,6 +1,9 @@
-from typing import TYPE_CHECKING, List, Literal
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, List, Literal, Optional
+import tempfile
 import polars as pl
-from .base import BaseOperation, OperationResults
+from .base import ALL_LOCI, BaseOperation, OperationResults
 from ..expressions import extract_genes
 from ..structure import safe_repertoire_name
 from tqdm import tqdm
@@ -8,27 +11,21 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from tcr_io.dataset import TcrDataset
 
+@dataclass
 class OverlapAnalyzer(BaseOperation):
     name = "overlap_analyzer"
     version = "0.1"
     description = "Analyzes the overlap between repertoires, calculating the number of shared clonotypes and the Spearman correlation between their frequencies."
+    supported_loci = ALL_LOCI
 
-    def __init__(
-            self,
-            top_n: int = 250,
-            junction_col : Literal["junction", "junction_aa"] = "junction",
-            threshold_sus_overlap :int = 40, # different patient, above this threshold, the overlap is suspicious 
-            threshold_sus_overlap_absence: int = 20 # same patient, below this threshold, the absence of overlap is suspicious
-            ):
-        self.top_n = top_n
-        self.junction_col = junction_col
-        self.threshold_sus_overlap = threshold_sus_overlap
-        self.threshold_sus_overlap_absence = threshold_sus_overlap_absence
+    top_n: int = 250
+    junction_col: Literal["junction", "junction_aa"] = "junction"
+    threshold_sus_overlap: int = 40           # different patient, above this the overlap is suspicious
+    threshold_sus_overlap_absence: int = 20   # same patient, below this the absence of overlap is suspicious
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
 
-        head_dir = ds.db_dir / "temp/heads"
-        head_dir.mkdir(exist_ok=True, parents=True)
+        head_dir = ds._operation_output_dir(self, "heads", locus)   # managed, recorded output
 
         for repertoire_id, df in ds.iter_repertoires(progress_bar=True, progress_desc="Collecting heads"):
             repertoire_id_safe = safe_repertoire_name(repertoire_id)
@@ -36,8 +33,8 @@ class OverlapAnalyzer(BaseOperation):
                 *extract_genes()
             ).sink_parquet(head_dir / f"{repertoire_id_safe}.parquet")
 
-        heads_tab_dir = ds.db_dir / "temp/heads_tab"
-        heads_tab_dir.mkdir(exist_ok=True, parents=True)
+        _heads_tab_tmp = tempfile.TemporaryDirectory()   # ephemeral scratch, not a recorded output
+        heads_tab_dir = Path(_heads_tab_tmp.name)
 
         pl.scan_parquet(head_dir).select(["v_gene", "j_gene", self.junction_col, "repertoire_id"]).sink_parquet(
             pl.PartitionBy(heads_tab_dir, key=["v_gene", "j_gene"])
@@ -53,6 +50,7 @@ class OverlapAnalyzer(BaseOperation):
                 ).filter(pl.col("count") > 1).collect(engine="streaming")
                 shared_clns_list.append(shared_clns)
                 progress_bar.update(1)
+        _heads_tab_tmp.cleanup()
 
         shared_clns_list = pl.concat(shared_clns_list).sort("count", descending=True).with_row_index("clone_id")
         overlap = pl.scan_parquet(
@@ -100,8 +98,8 @@ class OverlapAnalyzer(BaseOperation):
 
         return OperationResults(
             outputs={
-                "qc/overlap_table.parquet": overlap_table,
-                "qc/overlap_overview.parquet": overlap_overview
+                "overlap_table": overlap_table,
+                "overlap_overview": overlap_overview,
             }
         )
 
@@ -112,7 +110,7 @@ def plot_overlap(ds, x="hla_dist", y="n_overlap"):
     import matplotlib.pyplot as plt
 
     overlap_df = ds.get_operation_result("overlap_analyzer")
-    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "dist")
+    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "inferred_hla_distance")
     overlap_df = overlap_df.join(hla_dist_df, on=["repertoire_id", "repertoire_id_right"], how="left")
 
     q5, q95 = np.quantile(
@@ -151,7 +149,7 @@ def plot_overlap(ds, x="hla_dist", y="n_overlap"):
 def plot_interactive_overlap(ds, x="hla_dist", y="n_overlap"):
     import plotly.express as px
     overlap_df = ds.get_operation_result("overlap_analyzer")
-    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "dist")
+    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "inferred_hla_distance")
     overlap_df = overlap_df.join(hla_dist_df, on=["repertoire_id", "repertoire_id_right"], how="left")
 
 
@@ -184,7 +182,7 @@ def plot_sus_overlap_graph(ds, patient_ids: List[str], figsize=(8, 6),
     import seaborn as sns
 
     overlap_df = ds.get_operation_result("overlap_analyzer")
-    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "dist")
+    hla_dist_df = ds.get_operation_result("repertoire_hla_inference", "inferred_hla_distance")
     overlap_df = overlap_df.join(hla_dist_df, on=["repertoire_id", "repertoire_id_right"], how="left")
 
     q5, q95 = np.quantile(

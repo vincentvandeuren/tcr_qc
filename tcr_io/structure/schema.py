@@ -38,13 +38,6 @@ PUBLICATION_META = pl.Schema({
     "publication_id": pl.Utf8,
 }) # ndjson
 
-OPERATIONS_META = pl.Schema({
-    "operation_name": pl.Utf8,
-    "version": pl.Utf8,
-    "ran_at": pl.Datetime(),
-    "duration_s": pl.Float64,
-    "status": pl.Utf8,
-    "error": pl.Utf8,
-    "description": pl.Utf8,
-    "outputs": pl.List(pl.Utf8),
-}) # ndjson
+# Operation provenance is no longer a global polars-schema table. Each op writes a
+# self-describing `operations/<op>/operation.json` (the `OperationRecord` dataclass);
+# see tcr_io/operations/base.py.

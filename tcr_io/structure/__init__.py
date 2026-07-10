@@ -13,7 +13,6 @@ from .schema import (
     REPERTOIRE_META,
     PATIENT_META,
     PUBLICATION_META,
-    OPERATIONS_META,
 )
 from .layout import (
     Artifact,
@@ -24,17 +23,20 @@ from .layout import (
     REQUIRED_DIRS,
     GENERATED_DIRS,
     repertoire_relpath,
+    operation_relpath,
     safe_repertoire_name,
     render_tree,
 )
+from .writers import write_artifact
 from .version import DATASET_VERSION, Manifest
 
 __all__ = [
     "schema",
     "GENERATION_META", "REPERTOIRE", "REPERTOIRE_META", "PATIENT_META",
-    "PUBLICATION_META", "OPERATIONS_META",
+    "PUBLICATION_META",
     "Artifact", "Kind", "Role", "Layout", "LAYOUT",
     "REQUIRED_DIRS", "GENERATED_DIRS",
-    "repertoire_relpath", "safe_repertoire_name", "render_tree",
+    "repertoire_relpath", "operation_relpath", "safe_repertoire_name", "render_tree",
+    "write_artifact",
     "DATASET_VERSION", "Manifest",
 ]

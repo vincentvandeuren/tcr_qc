@@ -1,20 +1,25 @@
 import polars as pl
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional
 
 from .base import BaseOperation, OperationResults
 from ..filters import Filterer, get_filter_summary
 
+@dataclass
 class FilteringReport(BaseOperation):
     name = "filtering_report"
     version = "0.2"
     description = "Generates a report summarizing the reasons for filtering failures across repertoires."
+    supported_loci = None
 
-    def __init__(self, filterer: Filterer = Filterer(return_individual_filters=True)):
-        if not filterer.return_individual_filters:
-            raise ValueError("Filterer must be configured to return individual filters for the FilteringReport operation.")
-        self.filterer = filterer
+    def __post_init__(self):
+        # The `Filterer` (a list of polars expressions) is not serialisable config, so it is
+        # not a field: `params()` stays empty and `rerun` uses the default filterer. Making the
+        # filter config serialisable is a deferred follow-up (phased plan §6).
+        self.filterer = Filterer(return_individual_filters=True)
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         filter_summ = []
         top_invalid = defaultdict(list)
                 
@@ -74,6 +79,6 @@ class FilteringReport(BaseOperation):
             top_invalid_res[k] = df.group_by(df.columns[0]).agg(pl.col("len").sum()).sort("len", descending=True).rename({"len":"count"})
         
         return OperationResults(outputs={
-            "qc/filter/filter_summary.parquet": filter_summ,
-            **{f"qc/filter/filter_top_{reason}.parquet": df for reason, df in top_invalid_res.items()}
+            "filter_summary": filter_summ,
+            **{f"filter_top_{reason}": df for reason, df in top_invalid_res.items()}
         })

@@ -1,8 +1,9 @@
 # copy code from baseline technical features model
 from __future__ import annotations
-from .base import BaseOperation, OperationResults
+from .base import ALL_LOCI, BaseOperation, OperationResults
 from ..expressions import _determine_reference_points
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Optional
 import polars as pl
 
 if TYPE_CHECKING:
@@ -63,21 +64,23 @@ def determine_trim_features(df:pl.LazyFrame) -> pl.DataFrame:
 
     return df
 
+@dataclass
 class VdjStatisticsSummary(BaseOperation):
     name = "vdj_statistics_summary"
     version = "0.1"
     description = "Generates a report summarizing inferred likely VDJ trimming and insertion metrics across repertoires."
+    supported_loci = ALL_LOCI
 
 
-    def _run(self, ds) -> OperationResults:
-        
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
+
         vdj_stat_summ = []
         for rep_id, rep in ds.iter_repertoires(filter_pass_only=True, progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics"):
             m = determine_trim_features(rep).with_columns(pl.lit(rep_id).alias("repertoire_id")).collect()
             vdj_stat_summ.append(m)
 
         vdj_stat_summ = pl.concat(vdj_stat_summ)
-        
+
         return OperationResults(outputs={
-            "meta/repertoire/vdj_statistics_summary.parquet": vdj_stat_summ,
+            "vdj_statistics_summary": vdj_stat_summ,
         })

@@ -3,21 +3,24 @@ from tcr_io.operations.base import BaseOperation, OperationResults
 from tcr_io._resources import resource_path
 from tcr_io.expressions import extract_genes
 import polars as pl
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
+@dataclass
 class ECOClusterHits(BaseOperation):
     name = "ecocluster_hits"
     version = "0.2"
     description = "Counts the number of CMV ecocluster hits for each repertoire."
+    supported_loci = frozenset({"TRB"})
 
-    def __init__(self, model_checkpoint: str | Path | None = None):
-        if model_checkpoint is None:
-            path = resource_path("cmv_ecocluster.parquet")
-        else:
-            path = Path(model_checkpoint)
+    model_checkpoint: Optional[str] = None
+
+    def __post_init__(self):
+        path = resource_path("cmv_ecocluster.parquet") if self.model_checkpoint is None else Path(self.model_checkpoint)
         self.eco_df = pl.read_parquet(path).lazy()
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         
         eco_matches = []
 
@@ -50,5 +53,5 @@ class ECOClusterHits(BaseOperation):
         ).drop(["n_clonotypes", "total_duplicates"])
         
         return OperationResults(outputs={
-            "meta/repertoire/ecocluster_hits.parquet": eco_matches,
+            "ecocluster_hits": eco_matches,
         })

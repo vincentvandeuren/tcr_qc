@@ -486,12 +486,13 @@ def fetch_metadata(classified: ClassifiedIdentifier) -> List[StudyMetadata]:
 
 
 
+@dataclass
 class MetadataFetcher(BaseOperation):
     name = "metadata_fetcher"
     version = "0.1"
     description = "Fetches study metadata (title, abstract, authors, year, etc.) based on provided identifiers"
 
-    def _run(self, ds) -> OperationResults:
+    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
         result_ndjson = []
 
         publication_ids = ds.publication_meta["publication_id"]
@@ -505,6 +506,6 @@ class MetadataFetcher(BaseOperation):
                     result_ndjson.append(r)
 
         return OperationResults(
-            outputs={"meta/publication/publication_metadata": result_ndjson}
+            outputs={"publication_metadata": result_ndjson}
         )
         

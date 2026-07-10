@@ -6,40 +6,48 @@ from ..expressions import extract_genes, extract_locus
 
 import polars as pl
 from pathlib import Path
-from abc import ABC, abstractmethod
+from abc import ABC
+from dataclasses import dataclass
 from scipy.spatial.distance import pdist, squareform
 from itertools import combinations
 import numpy as np
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Optional
 
 if TYPE_CHECKING:
     from ..dataset import TcrDataset
 
+@dataclass
 class BaseHlaInferenceOperation(BaseOperation, ABC):
     name = "base_tcr2hla_inference"
     version = "0.1"
     description = "Base operation for TCR2HLA inference - does nothing"
+    # TRB-intrinsic model -> one locus-agnostic pass; the op filters to TRB internally and
+    # its outputs carry no <LOCUS>/ segment (see operations_restructure_phased_plan §3 wrinkle).
+    supported_loci = None
 
-    def __init__(self, model_checkpoint: str | Path | None = None):
-        if model_checkpoint is None:
+    model_checkpoint: Optional[str] = None
+
+    def __post_init__(self):
+        if self.model_checkpoint is None:
             tcrs_path = resource_path("hla_tcrs.parquet")
             wts_path = resource_path("hla_model_weights.parquet")
         else:
-            d = Path(model_checkpoint)
+            d = Path(self.model_checkpoint)
             tcrs_path = d / "hla_tcrs.parquet"
             wts_path = d / "hla_model_weights.parquet"
         self.tcrs = pl.read_parquet(tcrs_path).lazy()
         self.wts = pl.read_parquet(wts_path).lazy()
 
 
-class HlaInference(BaseHlaInferenceOperation, BaseOperation):
+@dataclass
+class HlaInference(BaseHlaInferenceOperation):
     name = "hla_inference"
     version = "0.4"
     description = "Infers HLA types from TCR repertoires using the method from HLA2TCR."
 
 
-    def _run(self, ds:TcrDataset) -> OperationResults:
+    def _run(self, ds: TcrDataset, locus: Optional[str] = None) -> OperationResults:
 
         tcrs = self.tcrs.with_columns(
             pl.col("score").abs() # i know this is weird but this also is done in the original code. if not, it can happen that the weighted score is negative and then the logarithm is nan. If it was added just to stop that, the nans should be replaced with 0 instead, but idk.
@@ -84,19 +92,20 @@ class HlaInference(BaseHlaInferenceOperation, BaseOperation):
 
         return OperationResults(
             outputs = {
-                "meta/patient/inferred_hla.parquet": res_wide,
-                "meta/patient/inferred_hla_long.parquet": res
+                "inferred_hla": res_wide,
+                "inferred_hla_long": res,
             }
         )
 
 
-class RepertoireHlaInference(BaseHlaInferenceOperation, BaseOperation):
+@dataclass
+class RepertoireHlaInference(BaseHlaInferenceOperation):
     name = "repertoire_hla_inference"
     version = "0.2"
     description = "Infers HLA types from TCR repertoires using the method from HLA2TCR. Does not group by patient"
 
 
-    def _run(self, ds:TcrDataset) -> OperationResults:
+    def _run(self, ds: TcrDataset, locus: Optional[str] = None) -> OperationResults:
 
         tcrs = self.tcrs.with_columns(
             pl.col("score").abs() # i know this is weird but this also is done in the original code. if not, it can happen that the weighted score is negative and then the logarithm is nan. If it was added just to stop that, the nans should be replaced with 0 instead, but idk.
@@ -154,16 +163,16 @@ class RepertoireHlaInference(BaseHlaInferenceOperation, BaseOperation):
 
         return OperationResults(
             outputs = {
-                "meta/repertoire/inferred_hla.parquet": res_wide,
-                "meta/repertoire/inferred_hla_long.parquet": res,
-                "meta/repertoire/inferred_hla_distance.parquet": rep_dist_df
+                "inferred_hla": res_wide,
+                "inferred_hla_long": res,
+                "inferred_hla_distance": rep_dist_df,
             }
         )
-    
+
 
 def get_hla_class_counts(ds:TcrDataset) -> pl.DataFrame:
 
-    h = ds.get_operation_result("repertoire_hla_inference", "long")
+    h = ds.get_operation_result("repertoire_hla_inference", "inferred_hla_long")
 
     inf = HlaInference()
 

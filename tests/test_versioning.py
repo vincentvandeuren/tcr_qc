@@ -24,7 +24,6 @@ def _make_dataset(manifest_version=None) -> Path:
         {"dataset_name": ["t"], "created_on": [None], "source": ["x"],
          "reader": ["r"], "repertoire_mapper": ["m"], "patient_mapper": ["m"]}
     ).cast(S.GENERATION_META).write_ndjson(d / Layout.generation_meta.path)
-    pl.DataFrame(schema=S.OPERATIONS_META).write_ndjson(d / Layout.operations_meta.path)
     if manifest_version is not None:
         Manifest(version=manifest_version, tcrio_version="t").write(d / Layout.manifest.path)
     return d
@@ -54,7 +53,7 @@ def test_dry_run_returns_plan_without_writing():
     ds = _make_dataset()
     d = TcrDataset(ds)
     plan = d.migrate(dry_run=True)
-    assert [m.to_version for m in plan] == [1]
+    assert [m.to_version for m in plan] == list(range(1, DATASET_VERSION + 1))
     assert not (Path(ds) / Layout.manifest.path).exists()
 
 
@@ -62,8 +61,8 @@ def test_migrate_backfills_and_is_idempotent():
     ds = _make_dataset()
     d = TcrDataset(ds)
     d.migrate()
-    assert d.version == 1
-    assert json.loads((Path(ds) / Layout.manifest.path).read_text())["version"] == 1
+    assert d.version == DATASET_VERSION
+    assert json.loads((Path(ds) / Layout.manifest.path).read_text())["version"] == DATASET_VERSION
     assert d.migrate() == []          # no-op second time
 
 
@@ -86,22 +85,23 @@ def test_future_version_raises():
 
 def test_commit_per_step_resume():
     """A mid-chain failure leaves the manifest at the last committed version; re-run resumes."""
-    ds = TcrDataset.migrated(_make_dataset())   # -> v1
+    ds = TcrDataset.migrated(_make_dataset())   # -> current DATASET_VERSION
+    nxt = DATASET_VERSION + 1                    # a synthetic next migration
     try:
-        migrations.REGISTRY[2] = Migration(2, "fails", lambda d: (_ for _ in ()).throw(RuntimeError("boom")))
+        migrations.REGISTRY[nxt] = Migration(nxt, "fails", lambda d: (_ for _ in ()).throw(RuntimeError("boom")))
         try:
-            ds.migrate(target=2)
+            ds.migrate(target=nxt)
             assert False, "expected RuntimeError"
         except RuntimeError:
             pass
-        assert ds.version == 1                  # not committed past the failure
+        assert ds.version == DATASET_VERSION     # not committed past the failure
 
         applied = []
-        migrations.REGISTRY[2] = Migration(2, "ok", lambda d: applied.append(1))
-        ds.migrate(target=2)
-        assert ds.version == 2 and applied == [1]
+        migrations.REGISTRY[nxt] = Migration(nxt, "ok", lambda d: applied.append(1))
+        ds.migrate(target=nxt)
+        assert ds.version == nxt and applied == [1]
     finally:
-        migrations.REGISTRY.pop(2, None)
+        migrations.REGISTRY.pop(nxt, None)
 
 
 if __name__ == "__main__":
