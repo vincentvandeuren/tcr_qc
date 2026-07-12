@@ -74,17 +74,23 @@ def extract_locus(
         v_call = pl.col("v_call"),
         j_call = pl.col("j_call"),
     ) -> pl.Expr:
-    v = v_call.str.slice(0, 3)
-    j = j_call.str.slice(0, 3)
-    # Locus is the 3-char prefix of the gene call (TRB, IGH, ...).
-    # If V and J disagree (or either is null), the row's locus is undefined -> null.
+    v_locus = v_call.str.slice(0, 3)
+    j_locus = j_call.str.slice(0, 3)
+    # TRAV/DV genes (e.g. TRAV14/DV4) are shared between the TRA and TRD chains, so their
+    # "TRA" prefix is ambiguous. The J gene disambiguates: these rows are TRA or TRD only,
+    # taken from the J prefix (any other J prefix -> undefined -> null).
+    # `\d+(?:-\d+)?` matches both TRAV14/DV4 and the hyphenated family TRAV38-2/DV8.
+    is_trav_dv = v_call.str.contains(r"TRAV\d+(?:-\d+)?\/DV")
     return (
-        pl.when(v == j)
-        .then(v)
+        pl.when(is_trav_dv)
+        .then(pl.when(j_locus.is_in(["TRA", "TRD"])).then(j_locus).otherwise(None))
+        # Locus is the 3-char prefix of the gene call (TRB, IGH, ...).
+        # If V and J disagree (or either is null), the row's locus is undefined -> null.
+        .when(v_locus == j_locus)
+        .then(v_locus)
         .otherwise(None)
         .alias("locus")
     )
-
 
 
 def assign_locus(
