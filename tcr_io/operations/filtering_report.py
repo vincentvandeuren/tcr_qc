@@ -3,7 +3,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .base import BaseOperation, OperationResults
+from .base import ALL_LOCI, BaseOperation, OperationResults
 from ..expressions import UNASSIGNED, KNOWN_LOCI
 from ..filters import FilterSet, FilterReport
 
@@ -33,12 +33,15 @@ ASSIGNMENT_REASONS: List[FilterReport] = [
 # cleanly separated (they're reported only on the _unassigned partition).
 _ASSIGNMENT_REASON_NAMES = frozenset(r.name for r in ASSIGNMENT_REASONS)
 
-# Empty-frame schema for the _unassigned summary (map_repertoires needs it when no rows exist).
-_UNASSIGNED_SCHEMA = pl.Schema({
-    "repertoire_id": pl.Utf8,
-    **{r.name: pl.UInt32 for r in ASSIGNMENT_REASONS},
-    "n_unassigned": pl.UInt32,
-})
+# Catch-all for a `filter_pass == False` row that no current reason explains. It should never fire:
+# its presence means the stored `filter_pass` and the report's rebuilt reasons disagree — i.e.
+# filter definitions or the IMGT reference drifted between ingest and report. Surfaced (rather than
+# silently dropped to a null column) so that drift is visible.
+_UNATTRIBUTED = FilterReport(
+    "unattributed", pl.lit(True), "v_call",
+    "Row failed ingest filtering but no current reason matched it — indicates the stored "
+    "filter_pass and the report's rebuilt filters/reference disagree (drift since ingestion).",
+)
 
 
 def first_reason(reasons: List[FilterReport]) -> pl.Expr:
@@ -65,9 +68,18 @@ def _legend(reasons: List[FilterReport]) -> pl.DataFrame:
 @dataclass
 class FilteringReport(BaseOperation):
     name = "filtering_report"
-    version = "0.3"
-    description = "Summarises why sequences were excluded: assignment failures (unassigned) and per-locus quality failures."
-    supported_loci = None   # locus-agnostic: this op loops over present loci itself
+    version = "0.5"   # 0.5: per-locus report (+ _unassigned pseudo-locus); capped top tables
+    description = "Per-locus report of why sequences were excluded: quality failures on each present locus, assignment failures on the _unassigned partition."
+    # Per present locus AND the `_unassigned` pseudo-locus (added by `loci_to_run`). Each locus's
+    # outputs land under operations/filtering_report/<LOCUS>/.
+    supported_loci = ALL_LOCI
+
+    top_n: int = 100   # cap for each filter_top_<reason> table (full scale is in filter_reason_totals)
+
+    def loci_to_run(self, present: frozenset) -> List[Optional[str]]:
+        # Real loci get a quality report; `_unassigned` gets an assignment report. Always emitted
+        # (empty tables when clean) so the output shape is consistent across datasets.
+        return sorted(present) + [UNASSIGNED]
 
     def _reasons_for(self, provenance: dict, locus: str) -> List[FilterReport]:
         """The ordered *quality* reason list for a locus, rebuilt from ingest provenance (falls back
@@ -77,81 +89,94 @@ class FilteringReport(BaseOperation):
         fset = FilterSet.from_names(entry["filters"]) if entry else FilterSet.named("default_trb")
         return [r for r in fset.reasons() if r.name not in _ASSIGNMENT_REASON_NAMES]
 
-    def _summarise_unassigned(self, rep: pl.LazyFrame) -> pl.LazyFrame:
-        attributed = rep.with_columns(first_reason(ASSIGNMENT_REASONS))
-        return attributed.select(
-            *[(pl.col("reason") == r.name).sum().cast(pl.UInt32).alias(r.name)
-              for r in ASSIGNMENT_REASONS],
-            pl.len().cast(pl.UInt32).alias("n_unassigned"),
-        )
-
     def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        provenance = ds._manifest.filters
-        quality_rows: list[tuple] = []               # (repertoire_id, reason, count)
-        top: dict[str, list] = defaultdict(list)     # reason -> [per-(rep,locus) group counts]
-        reason_meta: dict[str, FilterReport] = {}    # reason name -> FilterReport (legend/group_col)
+        is_unassigned = locus == UNASSIGNED
+        reasons = ASSIGNMENT_REASONS if is_unassigned else self._reasons_for(ds._manifest.filters, locus)
 
-        for loc in sorted(ds._present_loci()):
-            reasons = self._reasons_for(provenance, loc)
-            for r in reasons:
-                reason_meta.setdefault(r.name, r)
-            gcols = list({r.group_col for r in reasons})
+        reason_gcol = {r.name: r.group_col for r in reasons}
+        reason_gcol[_UNATTRIBUTED.name] = _UNATTRIBUTED.group_col
+        gcols = sorted({*reason_gcol.values()})
 
-            for rep_id, rep in ds.iter_repertoires(
-                locus=loc, filter_pass_only=False,
-                progress_bar=True, progress_desc=f"Filtering report ({loc})",
-            ):
-                failed = (
-                    rep.filter(pl.col("filter_pass").eq(False))
-                    .with_columns(first_reason(reasons))
-                    .select("reason", *gcols)
-                    .collect()
-                )
-                if failed.height == 0:
-                    continue
+        summary_rows: list[tuple] = []               # (repertoire_id, reason, count)
+        top: dict[str, list] = defaultdict(list)     # reason -> [per-repertoire group-count frames]
 
-                for row in failed.group_by("reason").len().iter_rows(named=True):
-                    quality_rows.append((rep_id, row["reason"], row["len"]))
+        for rep_id, rep in ds.iter_repertoires(
+            locus=locus, filter_pass_only=False,
+            progress_bar=True, progress_desc=f"Filtering report ({locus})",
+        ):
+            # On a real locus we explain the FAILED rows; the `_unassigned` partition is entirely
+            # assignment failures, so every row there is in scope.
+            sel = rep if is_unassigned else rep.filter(pl.col("filter_pass").eq(False))
+            failed = (
+                sel.with_columns(first_reason(reasons).fill_null(_UNATTRIBUTED.name).alias("reason"))
+                .select("reason", *gcols)
+                .collect()
+            )
+            if failed.height == 0:
+                continue
 
-                for r in reasons:
-                    sub = failed.filter(pl.col("reason") == r.name)
-                    if sub.height:
-                        top[r.name].append(
-                            sub.group_by(r.group_col).len().rename({"len": "count"})
-                        )
+            for row in failed.group_by("reason").len().iter_rows(named=True):
+                summary_rows.append((rep_id, row["reason"], row["len"]))
+
+            for name, gcol in reason_gcol.items():
+                sub = failed.filter(pl.col("reason") == name)
+                if sub.height:
+                    top[name].append(sub.group_by(gcol).len().rename({"len": "count"}))
+
+        # Reason/column order: this locus's reasons, plus `unattributed` only if it ever fired.
+        reason_names = [r.name for r in reasons]
+        if top.get(_UNATTRIBUTED.name):
+            reason_names.append(_UNATTRIBUTED.name)
 
         outputs: dict = {}
 
-        # --- per-repertoire first-failure exclusion counts (wide) ---------
-        if quality_rows:
-            summary = (
-                pl.DataFrame(quality_rows, schema=["repertoire_id", "reason", "count"], orient="row")
+        # --- per-repertoire first-failure counts (wide, one 0-filled column per reason) ---
+        outputs["filter_summary"] = self._summary(summary_rows, reason_names)
+
+        # --- top offending values per reason (capped; empty table when a reason never fired) ---
+        totals: list[tuple] = []
+        for name in reason_names:
+            gcol = reason_gcol[name]
+            frames = top.get(name)
+            if frames:
+                merged = (
+                    pl.concat(frames)
+                    .group_by(gcol).agg(pl.col("count").sum())
+                    .sort("count", descending=True)
+                )
+                outputs[f"filter_top_{name}"] = merged.head(self.top_n)
+                totals.append((name, int(merged["count"].sum()), merged.height))
+            else:
+                outputs[f"filter_top_{name}"] = pl.DataFrame(schema={gcol: pl.Utf8, "count": pl.UInt32})
+                totals.append((name, 0, 0))
+
+        # --- reason totals: true scale behind the capped tables --------------
+        outputs["filter_reason_totals"] = pl.DataFrame(
+            totals,
+            schema={"reason": pl.Utf8, "n_failed_rows": pl.Int64, "n_distinct_values": pl.UInt32},
+            orient="row",
+        )
+
+        # --- self-documenting legend for the reasons surfaced ----------------
+        outputs["filter_legend"] = _legend(
+            list(reasons) + ([_UNATTRIBUTED] if top.get(_UNATTRIBUTED.name) else [])
+        )
+
+        return OperationResults(outputs=outputs)
+
+    @staticmethod
+    def _summary(summary_rows: list[tuple], reason_names: List[str]) -> pl.DataFrame:
+        """Wide per-repertoire first-failure counts: one column per reason, 0-filled, stable order
+        (a reason with no failures still gets its column, so the schema is comparable across data)."""
+        if summary_rows:
+            wide = (
+                pl.DataFrame(summary_rows, schema=["repertoire_id", "reason", "count"], orient="row")
                 .pivot(on="reason", values="count", index="repertoire_id", aggregate_function="sum")
                 .fill_null(0)
             )
         else:
-            summary = pl.DataFrame(schema={"repertoire_id": pl.Utf8})
-        outputs["filter_summary"] = summary
-
-        # --- top offending values per reason ------------------------------
-        for reason_name, frames in top.items():
-            gcol = reason_meta[reason_name].group_col
-            outputs[f"filter_top_{reason_name}"] = (
-                pl.concat(frames)
-                .group_by(gcol).agg(pl.col("count").sum())
-                .sort("count", descending=True)
-            )
-
-        # --- assignment-stage summary on the _unassigned partition --------
-        outputs["unassigned_summary"] = ds.map_repertoires(
-            self._summarise_unassigned,
-            locus=UNASSIGNED, filter_pass_only=False, schema=_UNASSIGNED_SCHEMA,
-            progress_desc="Summarising unassigned-locus rows",
-        )
-
-        # --- self-documenting legend for every reason surfaced ------------
-        outputs["filter_legend"] = _legend(
-            list(reason_meta.values()) + ASSIGNMENT_REASONS
-        )
-
-        return OperationResults(outputs=outputs)
+            wide = pl.DataFrame(schema={"repertoire_id": pl.Utf8})
+        missing = [n for n in reason_names if n not in wide.columns]
+        if missing:
+            wide = wide.with_columns([pl.lit(0, dtype=pl.Int64).alias(n) for n in missing])
+        return wide.select(["repertoire_id", *reason_names])
