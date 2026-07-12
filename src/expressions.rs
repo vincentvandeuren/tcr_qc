@@ -2,7 +2,7 @@
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 use serde::Deserialize;
-use crate::genes_imgt::{Organism, GENE_ALIASES, IMGT_REF};
+use crate::genes_imgt::{Organism, DEFAULT_ALLELE, GENE_ALIASES, IMGT_REF};
 use crate::reference_points::{determine_reference_points};
 use crate::junction_trimmer::trim_junction_to_cdr3;
 
@@ -146,6 +146,12 @@ struct GeneToImgtKwargs {
     split_on_character: String,
 }
 
+/// Allele suffix to append to a bare (canonicalised) gene name. `*01` for every gene that has it;
+/// for the handful that don't, the lowest functional allele picked in `DEFAULT_ALLELE`.
+fn default_allele(gene: &str) -> &'static str {
+    DEFAULT_ALLELE.get(gene).map(|s| s.as_str()).unwrap_or("01")
+}
+
 #[polars_expr(output_type=String)]
 pub fn gene_to_imgt_canonical(inputs: &[Series], kwargs: GeneToImgtKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
@@ -168,8 +174,9 @@ pub fn gene_to_imgt_canonical(inputs: &[Series], kwargs: GeneToImgtKwargs) -> Po
                 .unwrap_or(gene);
             buf.push_str(mapped);
             buf.push('*');
+            // `*00` is IMGT's "allele unknown" placeholder -> treat as no allele info and default it.
             if allele == "00" {
-                buf.push_str("01");
+                buf.push_str(default_allele(mapped));
             } else {
                 buf.push_str(allele);
             }
@@ -179,7 +186,8 @@ pub fn gene_to_imgt_canonical(inputs: &[Series], kwargs: GeneToImgtKwargs) -> Po
                 .map(|s| s.as_str())
                 .unwrap_or(part);
             buf.push_str(mapped);
-            buf.push_str("*01");
+            buf.push('*');
+            buf.push_str(default_allele(mapped));
         }
     });
     Ok(out.with_name(ca.name().clone()).into_series())

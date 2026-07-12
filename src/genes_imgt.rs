@@ -121,6 +121,45 @@ pub static IMGT_REF: LazyLock<HashMap<Organism, HashMap<String, TcrData>>> =
         map
     });
 
+/// Allele to assume when a gene call has no usable allele info (bare gene name, or the IMGT
+/// `*00` "allele unknown" placeholder). Maps a bare gene -> allele suffix (e.g. `IGHV2-70D` ->
+/// `"04"`). Policy: **prefer `*01` when it exists** — so this map only holds genes where `*01`
+/// is absent, and the canonicaliser falls back to `"01"` for everything not listed here (zero
+/// behaviour change for the ~1400 genes that do have `*01`). When `*01` is absent, pick the
+/// lowest-numbered **functional** allele, else the lowest-numbered allele. Different alleles of a
+/// gene can differ in functionality; with no allele info we must commit to one, and this picks the
+/// lowest functional representative. Built from `IMGT_REF`, so it tracks the vendored reference.
+/// (Verified: no `*01`-less gene name occurs in more than one organism, so a global map is exact.)
+pub static DEFAULT_ALLELE: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    // gene -> [(allele_number, is_functional, allele_suffix)]
+    let mut by_gene: HashMap<&str, Vec<(u32, bool, &str)>> = HashMap::new();
+    for organism_map in IMGT_REF.values() {
+        for entry in organism_map.values() {
+            if let Some((_, allele)) = entry.id.1.split_once('*') {
+                if let Ok(num) = allele.parse::<u32>() {
+                    by_gene
+                        .entry(entry.gene.as_str())
+                        .or_default()
+                        .push((num, entry.is_functional, allele));
+                }
+            }
+        }
+    }
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (gene, mut alleles) in by_gene {
+        if alleles.iter().any(|(num, _, _)| *num == 1) {
+            continue; // `*01` exists -> canonicaliser's "01" default is already correct
+        }
+        alleles.sort_by_key(|(num, _, _)| *num);
+        let pick = alleles
+            .iter()
+            .find(|(_, functional, _)| *functional) // lowest functional (list is sorted)
+            .unwrap_or(&alleles[0]); // ...else lowest-numbered allele
+        out.insert(gene.to_string(), pick.2.to_string());
+    }
+    out
+});
+
 // D-segment reference for TRB, keyed to the TRB locus only. The `chain == TRB` filter is
 // load-bearing: the reference also contains TRD D-genes (TRDD1/2/3), and without it the "TRBD"
 // index pools TRBD + TRDD, so TRB junctions get matched against TRD D-segments — a wrong
