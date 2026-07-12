@@ -10,6 +10,7 @@ GENERATION_META = pl.Schema({
 }) # ndjson
 
 REPERTOIRE = pl.Schema({
+    "clonotype_id": pl.UInt32,   # per-(repertoire, locus) row number (assigned at ingest)
     "repertoire_id": pl.Utf8,
     "junction": pl.Utf8,
     "v_call": pl.Utf8,
@@ -17,6 +18,16 @@ REPERTOIRE = pl.Schema({
     "j_call": pl.Utf8,
     "duplicate_count": pl.Int64,
     "filter_pass": pl.Boolean,
+}) # parquet
+
+# Single-cell only: the clonotype<->cell mapping, long form (one row per cell membership).
+# clonotype_id is scoped by (repertoire_id, locus) — the same grain as the hive partition — so a
+# cell's paired chains (e.g. TRA + TRB) are distinct rows.
+CLONE_TO_CELL = pl.Schema({
+    "repertoire_id": pl.Utf8,
+    "locus": pl.Utf8,
+    "clonotype_id": pl.UInt32,
+    "cell_id": pl.Utf8,
 }) # parquet
 
 REPERTOIRE_META = pl.Schema({

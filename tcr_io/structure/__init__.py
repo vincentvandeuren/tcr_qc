@@ -13,6 +13,7 @@ from .schema import (
     REPERTOIRE_META,
     PATIENT_META,
     PUBLICATION_META,
+    CLONE_TO_CELL,
 )
 from .layout import (
     Artifact,
@@ -24,6 +25,7 @@ from .layout import (
     GENERATED_DIRS,
     repertoire_dir_relpath,
     repertoire_locus_relpath,
+    clone_to_cell_relpath,
     loci_glob,
     repertoire_meta_relpath,
     operation_relpath,
@@ -36,10 +38,11 @@ from .version import DATASET_VERSION, Manifest
 __all__ = [
     "schema",
     "GENERATION_META", "REPERTOIRE", "REPERTOIRE_META", "PATIENT_META",
-    "PUBLICATION_META",
+    "PUBLICATION_META", "CLONE_TO_CELL",
     "Artifact", "Kind", "Role", "Layout", "LAYOUT",
     "REQUIRED_DIRS", "GENERATED_DIRS",
-    "repertoire_dir_relpath", "repertoire_locus_relpath", "loci_glob", "repertoire_meta_relpath",
+    "repertoire_dir_relpath", "repertoire_locus_relpath", "clone_to_cell_relpath",
+    "loci_glob", "repertoire_meta_relpath",
     "operation_relpath", "safe_repertoire_name", "render_tree",
     "write_artifact",
     "DATASET_VERSION", "Manifest",

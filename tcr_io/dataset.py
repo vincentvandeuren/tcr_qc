@@ -58,8 +58,8 @@ from .operations import BaseOperation
 from .grouper import Grouper
 from .structure import (
     Layout, REQUIRED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath, loci_glob,
-    repertoire_meta_relpath, operation_relpath,
-    write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION,
+    repertoire_meta_relpath, clone_to_cell_relpath, operation_relpath,
+    write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION, CLONE_TO_CELL,
 )
 from .structure import schema as _schema
 from .expressions import UNASSIGNED
@@ -209,6 +209,15 @@ class TcrDataset:
         output_records: List[OutputRecord] = []
         start = time()
 
+        # A version bump can change an op's output set/layout (e.g. locus-agnostic -> per-locus).
+        # Clear the op dir so stale outputs from the old version are not orphaned and the old-layout
+        # record is not merged into the new one. Same-version (incremental per-locus) runs untouched.
+        prior = self._read_operation_record(operation.name)
+        if prior is not None and parse_version(prior.version) != parse_version(operation.version):
+            op_dir = self._operation_dir(operation.name)
+            if op_dir.exists():
+                shutil.rmtree(op_dir)
+
         for locus in operation.loci_to_run(present):
             if not force and self._operation_done(operation, locus):
                 continue
@@ -289,7 +298,8 @@ class TcrDataset:
         # Merge with a prior successful record so a partial (per-locus) re-run accumulates
         # loci/outputs rather than clobbering the ones we did not re-run this time.
         prior = self._read_operation_record(operation.name)
-        if status == "success" and prior is not None and prior.status == "success":
+        if (status == "success" and prior is not None and prior.status == "success"
+                and parse_version(prior.version) == parse_version(operation.version)):
             outputs += [o for o in prior.outputs if o.locus not in ran_loci]
             loci += [l for l in (prior.loci or []) if l not in loci]
 
@@ -474,6 +484,20 @@ class TcrDataset:
         if filter_pass_only:
             lf = lf.filter(pl.col("filter_pass"))
         return lf if lazy else lf.collect(engine="streaming")
+
+    def clone_to_cell(self, repertoire_id: Optional[str] = None, lazy: bool = False):
+        """Single-cell clonotype↔cell map, long form ``(repertoire_id, locus, clonotype_id,
+        cell_id)``. ``repertoire_id=None`` -> every single-cell repertoire; a specific id -> just
+        that one. Absent for bulk datasets (returns an empty frame with the `CLONE_TO_CELL` schema).
+        Join back to a clonotype on ``(repertoire_id, locus, clonotype_id)``."""
+        d = self.db_dir / Layout.clone_to_cell_dir.path
+        if repertoire_id is None:
+            files = sorted(d.glob("*.parquet")) if d.exists() else []
+        else:
+            one = self.db_dir / clone_to_cell_relpath(repertoire_id)
+            files = [one] if one.exists() else []
+        lf = pl.scan_parquet(files) if files else pl.LazyFrame(schema=CLONE_TO_CELL)
+        return lf if lazy else lf.collect()
 
     def iter_repertoires(self, locus:Optional[str]=None, lazy=True, progress_bar=False, filter_pass_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
         files = self._repertoire_files(locus)

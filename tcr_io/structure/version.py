@@ -13,7 +13,11 @@ from typing import List
 
 from .._internal import __version__ as _tcrio_version
 
-DATASET_VERSION = 4   # v4: per-repertoire hive layout — processed_repertoires/{id}/locus={LOCUS}/{id}.parquet
+DATASET_VERSION = 5   # v5: per-(repertoire, locus) `clonotype_id` in REPERTOIRE (row number within each
+                      #     locus partition); single-cell datasets also write meta/clone_to_cell/{id}.parquet
+                      #     (repertoire_id, locus, clonotype_id, cell_id). Migration backfills clonotype_id
+                      #     per hive file.
+                      # v4: per-repertoire hive layout — processed_repertoires/{id}/locus={LOCUS}/{id}.parquet
                       #     (locus is the hive partition, not stored in the file); written in one
                       #     pl.PartitionBy streaming pass. `present_loci` recorded in the manifest.
                       #     repertoire meta stored one parquet per locus (meta/repertoire/{LOCUS}.parquet).

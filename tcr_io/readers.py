@@ -8,6 +8,11 @@ from .grouper import Grouper
 import csv
 
 
+# name -> reader class. Every named reader auto-registers here (see BaseReader.__init_subclass__),
+# so ReaderFactory discovers them regardless of subclass depth. Mirrors filters.FILTER_REGISTRY.
+READER_REGISTRY: Dict[str, type["BaseReader"]] = {}
+
+
 class BaseReader(ABC):
     """
     Repertoire reader steps:
@@ -21,16 +26,28 @@ class BaseReader(ABC):
     When duplicate_group_when is 'by_file', step 3 and 4 are swapped
     When duplicate_group is None, step 4 is skipped
 
-    Filtering is NOT a reader step: it is applied by the ingester *after* locus assignment
-    (locus-aware quality filters); see docs/revamp_filters_phased_plan.md.
+    Filtering is no longer a reader step: it is applied by the ingester after locus assignment
+    (allowing for locus-specific filtering)
     """
     name: str = "abstract_reader"
-    col_map: ClassVar[Dict[Iterable[str]|str, str]] = {} # Mapping from input to output
-    null_values: ClassVar[List[str]] = [] # Values to treat as null
-    # Per-reader default grouper. Subclasses can point this at a different
-    # Grouper (e.g. a future SingleCellGrouper) or set it to None to skip
-    # grouping. An explicit `grouper=` arg to __init__ overrides it.
+    col_map: ClassVar[Dict[Iterable[str]|str, str]] = {}  # required input->output columns
+    # Optional input->output columns: mapped in when present, silently skipped when absent — so one
+    # reader serves both bulk and single-cell files (e.g. AirrReader adds `cell_id` here). They never
+    # affect whether a file matches this reader.
+    optional_col_map: ClassVar[Dict[Iterable[str]|str, str]] = {}
+    null_values: ClassVar[List[str]] = []  # Values to treat as null
+    # Character to split a multi-call field on before taking the first call (AIRR uses ","); None = no split.
+    call_split_char: ClassVar[Optional[str]] = None
+    # Per-reader default grouper. Set to None to skip grouping; an explicit `grouper=` arg overrides it.
     default_grouper: ClassVar[Grouper | None] = Grouper()
+
+    def __init_subclass__(cls, **kwargs):
+        # Auto-register each named reader so ReaderFactory finds it regardless of subclass depth
+        # (mirrors filters.FILTER_REGISTRY). Replaces the old BaseReader.__subclasses__() discovery
+        # that forced every reader to list `BaseReader` as a redundant second base to be found.
+        super().__init_subclass__(**kwargs)
+        if cls.__dict__.get("name"):
+            READER_REGISTRY[cls.name] = cls
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name}, col_map={self.col_map})"
@@ -108,21 +125,28 @@ class BaseReader(ABC):
         return fields, sep
 
     def _determine_col_map(self, header:List[str]) -> Optional[Dict[str, str]]:
+        """Resolve the reader's `col_map` (+ `optional_col_map`) against a file header.
+
+        Required (`col_map`): every entry must match a header column, else the file isn't for this
+        reader -> None. Optional (`optional_col_map`, e.g. single-cell `cell_id`): mapped in when
+        present, skipped when absent -> one reader serves both bulk and single-cell files.
         """
-        If the column mapping is can be determined, return it.
-        If the header does not match the expected columns, return None.
-        """
-        col_map = {}
+        col_map: Dict[str, str] = {}
+        # required — a miss disqualifies the file for this reader
         for input_cols, output_col in self.col_map.items():
-            if isinstance(input_cols, str):
-                input_cols = [input_cols]
-            for col in input_cols:
-                if col in header:
-                    col_map[col] = output_col
-                    break
-            else:
-                # return ValueError(f"None of the columns {input_cols} found in input file header: {header}")
+            options = [input_cols] if isinstance(input_cols, str) else list(input_cols)
+            match = next((c for c in options if c in header), None)
+            if match is None:
                 return None
+            col_map[match] = output_col
+        # optional — present -> map it; absent -> skip; never override a required mapping's output
+        for input_cols, output_col in self.optional_col_map.items():
+            if output_col in col_map.values():
+                continue
+            options = [input_cols] if isinstance(input_cols, str) else list(input_cols)
+            match = next((c for c in options if c in header), None)
+            if match is not None:
+                col_map[match] = output_col
         return col_map
 
     def _read(self, path:Path) -> pl.LazyFrame:
@@ -156,15 +180,17 @@ class BaseReader(ABC):
         return df
     
     def _process(self, df:pl.LazyFrame) -> pl.LazyFrame:
+        """Default standardisation: canonicalise V/J calls to IMGT and trim the nt junction to CDR3.
+
+        Readers that need extra reshaping (build a junction, strip score info, remap gene names, …)
+        override this, do their step, then ``return super()._process(df)``. `call_split_char` picks
+        the first call from a multi-call field (AIRR's comma-separated calls); None = no split.
         """
-        Standardize the input dataframe:
-        - Columns: junction_aa, junction, v_call, j_call, duplicate_count
-        - Handle any necessary transformations:
-            - Map gene aliases to imgt notation
-            - Trim nucleotide sequences to CDR3 region
-        - Keep any failed rows for QC purposes
-        """
-        pass
+        return df.with_columns(
+            to_imgt(pl.col("v_call"), split_on_character=self.call_split_char),
+            to_imgt(pl.col("j_call"), split_on_character=self.call_split_char),
+            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
+        )
 
 
 class MixcrReader(BaseReader):
@@ -181,12 +207,8 @@ class MixcrReader(BaseReader):
         df = df.with_columns(
             pl.col("v_call").str.extract(r"^([^(]+)", 1).str.replace(r"(^|[^/\\])[\\/]?DV", "${1}/DV"),
             pl.col("j_call").str.extract(r"^([^(]+)", 1).str.replace(r"(^|[^/\\])[\\/]?DV", "${1}/DV"), # remove score info and take first call if multiple
-        ).with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
         )
-        return df
+        return super()._process(df)
 
 
 class AdaptiveReader(BaseReader):
@@ -199,16 +221,8 @@ class AdaptiveReader(BaseReader):
         ("count (templates/reads)","templates", "seq_reads", "copy", "count", "count (reads)"):"duplicate_count",
     }
     null_values = ["unknown", "unresolved", "NA", "na"]
-    
-    def _process(self, df):
-        df = df.with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
-        )
-        return df
 
-    
+
 class AirrReader(BaseReader):
     name = "airr"
     col_map = {
@@ -218,16 +232,11 @@ class AirrReader(BaseReader):
     "j_call":"j_call",
     ("umi_count","duplicate_count", "count"):"duplicate_count",
     }
+    # AIRR fields can carry multiple comma-separated calls -> take the first (default _process).
+    call_split_char = ","
+    # AIRR single-cell files carry a `cell_id` column; picked up when present -> single-cell path.
+    optional_col_map = {"cell_id": "cell_id"}
 
-    def _process(self, df):
-        df =  df.with_columns(
-            to_imgt(pl.col("v_call"), split_on_character=","), # airr format can have multiple calls separated by comma, take the first one
-            to_imgt(pl.col("j_call"), split_on_character=","),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
-        )
-        return df
-
-        
 
 class TcrdistReader(BaseReader):
     name = "tcrdist"
@@ -238,16 +247,8 @@ class TcrdistReader(BaseReader):
         "j_gene":"j_call",
         "clone_size":"duplicate_count"
     }
-    
-    def _process(self, df):
-        df =  df.with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
-        )
-        return df
 
-        
+
 class VlasovaReader(BaseReader):
     name = "vlasova"
     col_map = {
@@ -258,38 +259,19 @@ class VlasovaReader(BaseReader):
         "count":"duplicate_count",
     }
 
-    def _process(self, df):
-        df =  df.with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
-        )
-        return df
 
 class CellrangerReader(BaseReader):
     name = "cellranger"
-    # TODO(single-cell): replace with a SingleCellGrouper that dedups within a
-    # cell while retaining `cell_id`. Until then, skip grouping so cells are not
-    # collapsed into clonotypes.
-    default_grouper = None
     col_map = {
         "cdr3_nt":"junction",
         "cdr3":"junction_aa",
         "v_gene":"v_call",
         "j_gene":"j_call",
         "umis":"duplicate_count",
-        "is_cell":"is_cell",
         "barcode":"cell_id",
     }
-    
-    def _process(self, df):
-        df =  df.with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
-        )
-        return df
-    
+
+
 class SynapseReader(BaseReader):
     name = "synapse"
     col_map = {
@@ -303,18 +285,14 @@ class SynapseReader(BaseReader):
         'fwr4':'fwr4',
         }
     def _process(self, df):
-        df= df.with_columns(
+        df = df.with_columns(
             junction_aa = pl.col("fwr3_aa").str.slice(-1) + pl.col("junction_aa") + pl.col("fwr4_aa").str.slice(0,1),
             junction = pl.col("fwr3").str.slice(-3)+pl.col("junction")+pl.col("fwr4").str.slice(0,3),
             duplicate_count = pl.lit(1)
-        ).with_columns(
-            to_imgt(pl.col("v_call")),
-            to_imgt(pl.col("j_call")),
-            trim_junction_to_cdr3(pl.col("junction"), pl.col("junction_aa")),
         )
-        return df
+        return super()._process(df)
     
-class PirdReader(AirrReader, BaseReader):
+class PirdReader(AirrReader):
     name = "pird"
     col_map = {
     "ntCDR3":"junction",
@@ -326,7 +304,7 @@ class PirdReader(AirrReader, BaseReader):
     null_values = ["na"]
 
 
-class BradleyReader(AirrReader, BaseReader):
+class BradleyReader(AirrReader):
     name = "tcrdist_without_clone_count_for_nicaragua_data"
     col_map = {
     "cdr3_nucseq":"junction",
@@ -341,7 +319,7 @@ class BradleyReader(AirrReader, BaseReader):
         )
         return super()._process(df)
 
-class RosatiReader(AirrReader, BaseReader):
+class RosatiReader(AirrReader):
     name = "rosati"
     col_map = {
         "nSeqCDR3": "junction",
@@ -356,7 +334,7 @@ class RosatiReader(AirrReader, BaseReader):
         ).unnest("aaVJ")
         return super()._process(df)
 
-class PogorelyyMixcrReader(MixcrReader, BaseReader):
+class PogorelyyMixcrReader(MixcrReader):
     name = "mixcr_from_pogorelyy_2018"
     col_map = {
         "N. Seq. CDR3":"junction",
@@ -366,7 +344,7 @@ class PogorelyyMixcrReader(MixcrReader, BaseReader):
         "Clone count":"duplicate_count",
     }
 
-class KoshlanTcrdistReader(AirrReader, BaseReader):
+class KoshlanTcrdistReader(AirrReader):
     name = "tcrdist3_koshlan"
     col_map = {
         "cdr3_b_aa":"junction_aa",
@@ -393,7 +371,7 @@ immunarch_gene_map = {
     'TRBV3-1/03-2': 'TRBV3-1',
 }
 
-class ImmunArchReader(AirrReader, BaseReader):
+class ImmunArchReader(AirrReader):
     name = "immunearch"
     col_map = {
     "CDR3.nt":"junction",
@@ -409,7 +387,7 @@ class ImmunArchReader(AirrReader, BaseReader):
         )
         return super()._process(df)
     
-class TcrDbReader(AirrReader, BaseReader):
+class TcrDbReader(AirrReader):
     name = "tcrdb"
     col_map = {
         "NNSeq":"junction",
@@ -426,8 +404,8 @@ class ReaderFactory:
         if readers is not None:
             self.readers = readers
         else:
-            self.readers = [cls() for cls in BaseReader.__subclasses__()]
-        
+            self.readers = [cls() for cls in READER_REGISTRY.values()]
+
         self.last_resolved_reader_ = None
 
     
@@ -444,7 +422,7 @@ class ReaderFactory:
             paths = list(paths)  # materialize generators / other iterables so paths[0] works
 
         first_file = paths[0]
-        header, sep = self.base_reader()._read_header(first_file)
+        header, _ = self.base_reader()._read_header(first_file)
 
         for reader in self.readers:
             if reader._determine_col_map(header) is not None:

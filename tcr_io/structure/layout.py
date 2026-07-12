@@ -78,6 +78,9 @@ class Layout:
     patient_meta    = Artifact("meta/patient/patient.parquet", Kind.PARQUET, schema=schema.PATIENT_META, description="one row per patient")
     publication_ids = Artifact("meta/publication/publication_ids.json", Kind.NDJSON, schema=schema.PUBLICATION_META, description="DOIs / pubmed ids")
 
+    # --- single-cell clonotype<->cell map (present only for single-cell datasets) ---
+    clone_to_cell_dir = Artifact("meta/clone_to_cell", Kind.DIR, role=Role.OPTIONAL, description="single-cell clonotype↔cell map (one parquet per repertoire)")
+
     # --- optional side files (joined in if present) ---
     repertoire_meta_extra = Artifact("meta/repertoire/repertoire_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-repertoire metadata, joined on repertoire_id")
     patient_meta_extra    = Artifact("meta/patient/patient_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-patient metadata, joined on patient_id")
@@ -113,6 +116,13 @@ def repertoire_locus_relpath(repertoire_id: str, locus: str) -> str:
     """
     safe = safe_repertoire_name(repertoire_id)
     return f"{Layout.processed_dir.path}/{safe}/locus={locus}/{safe}.parquet"
+
+
+def clone_to_cell_relpath(repertoire_id: str) -> str:
+    """A repertoire's single-cell clonotype↔cell map: ``meta/clone_to_cell/{repertoire_id}.parquet``.
+    Written only for single-cell repertoires (the dir is `Role.OPTIONAL`, created lazily on first write).
+    """
+    return f"{Layout.clone_to_cell_dir.path}/{safe_repertoire_name(repertoire_id)}.parquet"
 
 
 def loci_glob(locus: str = "*") -> str:

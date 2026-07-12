@@ -34,6 +34,28 @@ def test_first_migration_is_registered():
     assert 1 in migrations.REGISTRY
 
 
+def test_v5_migration_backfills_clonotype_id():
+    """v4->v5 adds a per-(repertoire, locus) clonotype_id (0..N-1) to each hive parquet."""
+    from tcr_io.structure import repertoire_locus_relpath
+    d = _make_dataset()
+    Manifest(version=4, tcrio_version="t", present_loci=["TRB"]).write(d / Layout.manifest.path)
+    f = d / repertoire_locus_relpath("r1", "TRB")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    # v4-shaped hive file: no clonotype_id column yet
+    pl.DataFrame({
+        "repertoire_id": ["r1"] * 3, "junction": ["A", "B", "C"], "v_call": ["TRBV2*01"] * 3,
+        "junction_aa": ["CA", "CB", "CC"], "j_call": ["TRBJ1*01"] * 3,
+        "duplicate_count": [3, 2, 1], "filter_pass": [True, True, False],
+    }).write_parquet(f)
+
+    ds = TcrDataset.migrated(d)
+    assert ds.version == DATASET_VERSION
+    out = pl.read_parquet(f)
+    assert out.columns[0] == "clonotype_id"          # leading column, per REPERTOIRE order
+    assert out["clonotype_id"].dtype == pl.UInt32
+    assert out["clonotype_id"].to_list() == [0, 1, 2]   # contiguous within the file
+
+
 def test_fresh_dataset_loads_clean():
     ds = _make_dataset(manifest_version=DATASET_VERSION)
     with warnings.catch_warnings():
@@ -109,11 +131,14 @@ def test_v4_migration_relocates_to_hive_layout():
     """v3->v4 moves flat processed parquets into {id}/locus=TRB/{id}.parquet and
     repertoire.parquet -> TRB.parquet, and records present_loci in the manifest."""
     d = _make_dataset(manifest_version=3)
+    # v3-shaped fixture: no clonotype_id column (that lands in v5). The v4 migration only relocates
+    # the file; the v5 migration then backfills clonotype_id — so cast to the *current* REPERTOIRE
+    # here would be wrong. Write the old shape as-is.
     pl.DataFrame(
         {"repertoire_id": ["r1"], "junction": ["TGT"], "v_call": ["TRBV2*01"],
          "junction_aa": ["CASSF"], "j_call": ["TRBJ2-1*01"], "duplicate_count": [3],
          "filter_pass": [True]}
-    ).cast(S.REPERTOIRE).write_parquet(Path(d) / "processed_repertoires/r1.parquet")
+    ).write_parquet(Path(d) / "processed_repertoires/r1.parquet")
 
     ds = TcrDataset.migrated(d)
     assert ds.version == DATASET_VERSION

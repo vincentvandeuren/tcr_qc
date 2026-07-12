@@ -6,6 +6,10 @@ from typing import List, Literal
 # new columns (e.g. locus, c_call, cell_id) are never silently dropped.
 DEFAULT_SUM_COLS = ["duplicate_count"]
 DEFAULT_JOIN_COLS = ["file"]
+# Columns aggregated into a list per clonotype. `cell_id` present -> single-cell: the per-clonotype
+# cell membership becomes a List(Utf8), later exploded into `clone_to_cell`. A no-op unless the
+# column is present, so bulk data is unaffected — no SingleCellGrouper needed.
+DEFAULT_LIST_COLS = ["cell_id"]
 
 
 class Grouper:
@@ -29,6 +33,7 @@ class Grouper:
             by: Literal["clonotype_nt", "clonotype_aa"] = "clonotype_nt",
             sum_cols: List[str] = DEFAULT_SUM_COLS,
             join_cols: List[str] = DEFAULT_JOIN_COLS,
+            list_cols: List[str] = DEFAULT_LIST_COLS,
             sort: bool = True,
         ):
         if by not in self.CLONOTYPE_KEYS:
@@ -36,6 +41,7 @@ class Grouper:
         self.by = by
         self.sum_cols = sum_cols
         self.join_cols = join_cols
+        self.list_cols = list(list_cols)
         self.sort = sort
 
     def _group_keys(self) -> List[str]:
@@ -51,6 +57,10 @@ class Grouper:
                 aggs.append(pl.col(col).cast(int).fill_null(1).sum().alias(col))
             elif col in self.join_cols:
                 aggs.append(pl.col(col).unique().str.join(";").alias(col))
+            elif col in self.list_cols:
+                # -> List of the group's members (e.g. cell_id). Order within the list is
+                # immaterial: the clonotype table drops it and clone_to_cell explodes it (a set).
+                aggs.append(pl.col(col))
             else:
                 aggs.append(pl.col(col).first())
         return aggs

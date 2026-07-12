@@ -15,8 +15,8 @@ from .expressions import assign_locus, UNASSIGNED
 from .filters import FilterSet, PerLocusFilterSet
 from .structure import (
     Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath,
-    loci_glob, repertoire_meta_relpath, Manifest,
-    REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META,
+    clone_to_cell_relpath, loci_glob, repertoire_meta_relpath, Manifest,
+    REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META, CLONE_TO_CELL,
 )
 
 
@@ -134,11 +134,16 @@ class DatasetIngester:
         return TcrDataset(self.db_dir)
     
     def _process_repertoires(self, repertoires) -> set:
-        """Write each repertoire in a single streaming `pl.PartitionBy` pass, partitioned by locus.
-        A repertoire's frame is derived once (read/dedup/filter) and streamed to
-        ``{id}/locus={LOCUS}/{id}.parquet`` — no collect, no per-locus re-execution. Rows with no
-        derivable locus ride the ``locus=_unassigned/`` partition (see `assign_locus`). Returns the
-        set of real loci written across all repertoires (excluding `_unassigned`)."""
+        """Write each repertoire partitioned by locus (``{id}/locus={LOCUS}/{id}.parquet``); rows
+        with no derivable locus ride the ``locus=_unassigned/`` partition (see `assign_locus`).
+        ``clonotype_id`` is a per-``(repertoire, locus)`` row number (``int_range().over("locus")``),
+        so identity is ``(repertoire_id, locus, clonotype_id)`` — the hive grain.
+
+        Bulk streams in one `sink_parquet(PartitionBy)` pass (no collect). Single-cell (a
+        ``cell_id: List`` column from the grouper) **collects once** so one fixed row order backs
+        both the clonotype table and the exploded ``clone_to_cell`` map — two lazy executions could
+        reorder and desync the positional id (see docs/clonotype_id_implementation_plan.md §3).
+        Returns the set of real loci written across all repertoires (excluding `_unassigned`)."""
         present: set = set()
         for repertoire_id, files in tqdm(repertoires.items(), desc="Reading repertoires"):
             df = self.reader.run(files).with_columns(
@@ -146,13 +151,32 @@ class DatasetIngester:
                 assign_locus(),                          # partition key; unknown/mismatch -> _unassigned
             ).pipe(                                       # locus-aware quality filter -> filter_pass
                 self.filter_set.run                      # (_unassigned rows forced to fail)
-            ).select([*REPERTOIRE.keys(), "locus"])       # locus is the key only (include_key=False)
+            )
 
             base = self.db_dir / repertoire_dir_relpath(repertoire_id)
-            df.sink_parquet(pl.PartitionBy(
-                str(base), key=["locus"], include_key=False,
+            partition = pl.PartitionBy(
+                str(base), key=["locus"], include_key=False,   # locus is the path, not a column
                 file_path_provider=self._locus_file_provider(repertoire_id),
-            ))
+            )
+            clonotype_id = pl.int_range(pl.len(), dtype=pl.UInt32).over("locus")
+
+            if df.collect_schema().get("cell_id") == pl.List(pl.Utf8):
+                # single-cell: collect ONCE, then both artifacts share this row order / id assignment
+                grouped = df.collect(engine="streaming").with_columns(clonotype_id=clonotype_id)
+                grouped.select([*REPERTOIRE.keys(), "locus"]).write_parquet(partition)
+
+                ctc_path = self.db_dir / clone_to_cell_relpath(repertoire_id)
+                ctc_path.parent.mkdir(parents=True, exist_ok=True)   # lazy: meta/clone_to_cell only if single-cell
+                (grouped.select("repertoire_id", "locus", "clonotype_id", "cell_id")
+                        .explode("cell_id")
+                        .select(CLONE_TO_CELL.keys()).cast(CLONE_TO_CELL)
+                        .write_parquet(ctc_path))
+            else:
+                # bulk: fully streamed single sink; clonotype_id numbered within each locus partition
+                (df.with_columns(clonotype_id=clonotype_id)
+                   .select([*REPERTOIRE.keys(), "locus"])
+                   .sink_parquet(partition))
+
             present |= self._loci_written(base)
         present.discard(UNASSIGNED)
         return present

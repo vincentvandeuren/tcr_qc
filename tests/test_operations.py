@@ -34,7 +34,7 @@ def _make_dataset() -> Path:
             "j_call": ["TRBJ2-1*01", "TRBJ2-1*01", "TRBJ1-1*01"],
             "duplicate_count": [10, 5, 1],
             "filter_pass": [True, True, False],
-        }).cast(S.REPERTOIRE).write_parquet(f)   # locus is the path, not a column
+        }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)   # locus is the path, not a column
 
     pl.DataFrame({
         "repertoire_id": reps, "source_files": [["a"], ["b"]], "patient_id": ["p1", "p1"],
@@ -278,13 +278,18 @@ def test_filtering_report_unassigned_summary():
         "repertoire_id": ["rep_a"] * 2, "junction": ["TGA", "TGG"],
         "v_call": [None, "TRBV2*01"], "junction_aa": ["CASSL", "CASSX"],
         "j_call": ["TRBJ2-1*01", None], "duplicate_count": [1, 1], "filter_pass": [False, False],
-    }).cast(S.REPERTOIRE).write_parquet(f)
+    }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)
 
     ds.run_operation(FilteringReport())
-    us = ds.get_operation_result("filtering_report", "unassigned_summary")
-    row = us.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
-    # first-failure attribution over ASSIGNMENT_REASONS: one null_v, one null_j, 2 unassigned total
-    assert (row["null_v"], row["null_j"], row["n_unassigned"]) == (1, 1, 2)
+    # Assignment failures now live under the `_unassigned` pseudo-locus, same shape as a quality
+    # report: a wide first-failure summary + per-reason top tables + totals.
+    summ = ds.get_operation_result("filtering_report", "filter_summary", "_unassigned")
+    row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
+    # first-failure attribution over ASSIGNMENT_REASONS: one null_v, one null_j
+    assert (row["null_v"], row["null_j"]) == (1, 1)
+    totals = ds.get_operation_result("filtering_report", "filter_reason_totals", "_unassigned")
+    t = dict(zip(totals["reason"].to_list(), totals["n_failed_rows"].to_list()))
+    assert t["null_v"] == 1 and t["null_j"] == 1
 
 
 def test_filtering_report_quality_population():
@@ -302,11 +307,12 @@ def test_filtering_report_quality_population():
         "duplicate_count": [10, 1, 1, 1],
         # row0 passes; rows 1-3 fail (reasons: valid_junction_aa, invalid_v_call, null_junction)
         "filter_pass":   [True, False, False, False],
-    }).cast(S.REPERTOIRE).write_parquet(f)
+    }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)
 
     ds.run_operation(FilteringReport())
 
-    summ = ds.get_operation_result("filtering_report", "filter_summary")
+    # Outputs are now per-locus under operations/filtering_report/TRB/.
+    summ = ds.get_operation_result("filtering_report", "filter_summary", "TRB")
     row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
     # first-failure attribution: the (null junction + "XXX") row counts as null_junction, NOT
     # invalid_junction_aa (null_junction comes first in the default set). Failure reason for a bad
@@ -315,18 +321,23 @@ def test_filtering_report_quality_population():
     assert row["invalid_v_call"] == 1
     assert row["null_junction"] == 1
 
-    top_aa = ds.get_operation_result("filtering_report", "filter_top_invalid_junction_aa")
+    top_aa = ds.get_operation_result("filtering_report", "filter_top_invalid_junction_aa", "TRB")
     assert top_aa.filter(pl.col("junction_aa") == "XXX")["count"].to_list() == [1]
-    top_v = ds.get_operation_result("filtering_report", "filter_top_invalid_v_call")
+    top_v = ds.get_operation_result("filtering_report", "filter_top_invalid_v_call", "TRB")
     assert top_v.filter(pl.col("v_call") == "TRBV999*01")["count"].to_list() == [1]
 
-    legend = ds.get_operation_result("filtering_report", "filter_legend")
+    # an empty top table is still emitted for a quality reason that never fired
+    empty = ds.get_operation_result("filtering_report", "filter_top_invalid_j_call", "TRB")
+    assert empty.height == 0 and empty.columns == ["j_call", "count"]
+
+    legend = ds.get_operation_result("filtering_report", "filter_legend", "TRB")
     assert {"reason", "description", "group_col"} <= set(legend.columns)
     assert "imgt_functional" not in legend["reason"].to_list()   # expanded into sub-reasons
     assert "invalid_v_call" in legend["reason"].to_list()
-    # a reason appearing in both the quality set and ASSIGNMENT_REASONS is listed once
     assert legend["reason"].n_unique() == legend.height
-    assert legend.filter(pl.col("reason") == "null_v").height == 1
+    # assignment reasons (null_v/null_j) are NOT in a real locus's quality legend — they are
+    # reported only on the _unassigned partition (population separation).
+    assert "null_v" not in legend["reason"].to_list()
 
 
 def test_map_repertoires_empty_needs_schema():
