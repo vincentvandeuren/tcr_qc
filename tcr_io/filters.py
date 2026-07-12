@@ -306,3 +306,13 @@ def _default_trb() -> FilterSet:
         ValidJunctionAaFilter(),
         ImgtFunctionalFilter(),
     ])
+
+@register_filter_set("no_junction_nt_trb")
+def _no_junction_nt_trb() -> FilterSet:
+    return FilterSet([
+        NullVFilter(),
+        NullJFilter(),
+        NullJunctionAAFilter(),
+        ValidJunctionAaFilter(),
+        ImgtFunctionalFilter(),
+    ])
