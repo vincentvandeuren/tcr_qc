@@ -10,7 +10,7 @@ from .mappers import (
     DictMapper,
     ChainedMapper,
 )
-from .filters import Filterer
+from .filters import FilterSet, PerLocusFilterSet, register_filter_set
 from .grouper import Grouper
 from . import operations
 
@@ -25,7 +25,9 @@ __all__ = [
     "RegexMapper",
     "DictMapper",
     "ChainedMapper",
-    "Filterer",
+    "FilterSet",
+    "PerLocusFilterSet",
+    "register_filter_set",
     "Grouper",
     "operations",
 ]

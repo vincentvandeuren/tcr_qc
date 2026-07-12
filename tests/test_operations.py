@@ -283,7 +283,50 @@ def test_filtering_report_unassigned_summary():
     ds.run_operation(FilteringReport())
     us = ds.get_operation_result("filtering_report", "unassigned_summary")
     row = us.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
-    assert (row["n_null_v_call"], row["n_null_j_call"], row["n_unassigned"]) == (1, 1, 2)
+    # first-failure attribution over ASSIGNMENT_REASONS: one null_v, one null_j, 2 unassigned total
+    assert (row["null_v"], row["null_j"], row["n_unassigned"]) == (1, 1, 2)
+
+
+def test_filtering_report_quality_population():
+    from tcr_io.operations.filtering_report import FilteringReport
+    ds = _ds()
+    # Overwrite rep_a's TRB partition with rows whose failure reasons are known. The report
+    # recomputes WHY from the data (filter_pass just marks a row as failed).
+    f = ds.db_dir / repertoire_locus_relpath("rep_a", "TRB")
+    pl.DataFrame({
+        "repertoire_id": ["rep_a"] * 4,
+        "junction":      ["TGTGCC", "TGTGCC",   "TGTGCC",      None],
+        "v_call":        ["TRBV2*01", "TRBV2*01", "TRBV999*01", "TRBV2*01"],
+        "junction_aa":   ["CASSLGYEQYF", "XXX",   "CASSLGYEQYF", "XXX"],
+        "j_call":        ["TRBJ2-1*01"] * 4,
+        "duplicate_count": [10, 1, 1, 1],
+        # row0 passes; rows 1-3 fail (reasons: valid_junction_aa, invalid_v_call, null_junction)
+        "filter_pass":   [True, False, False, False],
+    }).cast(S.REPERTOIRE).write_parquet(f)
+
+    ds.run_operation(FilteringReport())
+
+    summ = ds.get_operation_result("filtering_report", "filter_summary")
+    row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
+    # first-failure attribution: the (null junction + "XXX") row counts as null_junction, NOT
+    # invalid_junction_aa (null_junction comes first in the default set). Failure reason for a bad
+    # junction_aa is "invalid_junction_aa" (not the pass-condition name "valid_junction_aa").
+    assert row["invalid_junction_aa"] == 1
+    assert row["invalid_v_call"] == 1
+    assert row["null_junction"] == 1
+
+    top_aa = ds.get_operation_result("filtering_report", "filter_top_invalid_junction_aa")
+    assert top_aa.filter(pl.col("junction_aa") == "XXX")["count"].to_list() == [1]
+    top_v = ds.get_operation_result("filtering_report", "filter_top_invalid_v_call")
+    assert top_v.filter(pl.col("v_call") == "TRBV999*01")["count"].to_list() == [1]
+
+    legend = ds.get_operation_result("filtering_report", "filter_legend")
+    assert {"reason", "description", "group_col"} <= set(legend.columns)
+    assert "imgt_functional" not in legend["reason"].to_list()   # expanded into sub-reasons
+    assert "invalid_v_call" in legend["reason"].to_list()
+    # a reason appearing in both the quality set and ASSIGNMENT_REASONS is listed once
+    assert legend["reason"].n_unique() == legend.height
+    assert legend.filter(pl.col("reason") == "null_v").height == 1
 
 
 def test_map_repertoires_empty_needs_schema():

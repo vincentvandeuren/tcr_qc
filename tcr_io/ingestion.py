@@ -12,6 +12,7 @@ import shutil
 
 from .dataset import TcrDataset
 from .expressions import assign_locus, UNASSIGNED
+from .filters import FilterSet, PerLocusFilterSet
 from .structure import (
     Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath,
     loci_glob, repertoire_meta_relpath, Manifest,
@@ -43,7 +44,8 @@ class DatasetIngester:
         patient_mapper: BaseMapper,
         reader: BaseReader | ReaderFactory | None = None,
         publication_ids : List[str] | None = None,
-        allow_overwrite: bool = False
+        allow_overwrite: bool = False,
+        filter_set: FilterSet | PerLocusFilterSet | None = None,
     ):
         self.db_dir = (Path(db_dir) / db_name).resolve()
         self.reader = reader or ReaderFactory()
@@ -52,6 +54,13 @@ class DatasetIngester:
         self.db_name = db_name
         self.publication_ids = publication_ids or []
         self.allow_overwrite = allow_overwrite
+        # Quality filters run AFTER locus assignment (locus-aware). A plain FilterSet is applied
+        # uniformly to every known locus; None -> the default TR preset over every known locus.
+        if filter_set is None:
+            filter_set = PerLocusFilterSet.uniform(FilterSet.named("default_trb"))
+        elif isinstance(filter_set, FilterSet):
+            filter_set = PerLocusFilterSet.uniform(filter_set)
+        self.filter_set = filter_set
 
     def _create_structure(self):
         if self.db_dir.exists():
@@ -116,7 +125,10 @@ class DatasetIngester:
         )
         # operations/ is created empty by _create_structure (a GENERATED_DIR); ops fill it
         # on demand with per-op operation.json records — there is no global ledger to seed.
-        Manifest.current(present_loci=sorted(present_loci)).write(self.db_dir / Layout.manifest.path)
+        Manifest.current(
+            present_loci=sorted(present_loci),
+            filters=self.filter_set.provenance(),   # record the exact set(s) used, per locus
+        ).write(self.db_dir / Layout.manifest.path)
 
         logger.info("Dataset processing complete.")
         return TcrDataset(self.db_dir)
@@ -132,6 +144,8 @@ class DatasetIngester:
             df = self.reader.run(files).with_columns(
                 pl.lit(repertoire_id).alias("repertoire_id"),
                 assign_locus(),                          # partition key; unknown/mismatch -> _unassigned
+            ).pipe(                                       # locus-aware quality filter -> filter_pass
+                self.filter_set.run                      # (_unassigned rows forced to fail)
             ).select([*REPERTOIRE.keys(), "locus"])       # locus is the key only (include_key=False)
 
             base = self.db_dir / repertoire_dir_relpath(repertoire_id)

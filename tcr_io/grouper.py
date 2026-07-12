@@ -10,7 +10,7 @@ DEFAULT_JOIN_COLS = ["file"]
 
 class Grouper:
     """
-    Collapses duplicate rows into clonotypes, mirroring the `Filterer` pattern:
+    Collapses duplicate rows into clonotypes, mirroring the `FilterSet` pattern:
     a configurable object with a single `run(df) -> df` entrypoint.
 
     The clonotype key is chosen by `by`; every non-key column is carried through

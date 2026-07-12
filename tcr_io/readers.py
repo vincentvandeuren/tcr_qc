@@ -4,24 +4,25 @@ from pathlib import Path
 from typing import Tuple, List, Dict, ClassVar, Optional, Iterable, Literal
 import gzip
 from .expressions import to_imgt, trim_junction_to_cdr3, is_functional_tcr
-from .filters import Filterer
 from .grouper import Grouper
 import csv
 
 
 class BaseReader(ABC):
     """
-    Repertoire reader steps: 
+    Repertoire reader steps:
     When duplicate_group_when is 'by_run' (default):
 
     1. Read
     2. Process (standardize columns, map gene aliases to IMGT, trim junctions)
-    3. Concatenate (if multiple files) 
+    3. Concatenate (if multiple files)
     4. Group duplicates
-    5. Filter
 
     When duplicate_group_when is 'by_file', step 3 and 4 are swapped
     When duplicate_group is None, step 4 is skipped
+
+    Filtering is NOT a reader step: it is applied by the ingester *after* locus assignment
+    (locus-aware quality filters); see docs/revamp_filters_phased_plan.md.
     """
     name: str = "abstract_reader"
     col_map: ClassVar[Dict[Iterable[str]|str, str]] = {} # Mapping from input to output
@@ -35,11 +36,9 @@ class BaseReader(ABC):
         return f"{self.__class__.__name__}(name={self.name}, col_map={self.col_map})"
 
     def __init__(self,
-                 filterer: Filterer | None = None,
                  grouper: Grouper | None = None,
                  duplicate_group_when : Optional[Literal["by_file", "by_run"]] = "by_run",
                  ):
-        self.filterer = Filterer() if filterer is None else filterer
         self.grouper = self.default_grouper if grouper is None else grouper
         self.duplicate_group_when = duplicate_group_when
 
@@ -70,7 +69,6 @@ class BaseReader(ABC):
         df = self._process(df)
         if self._should_group:
             df = self.grouper.run(df)
-        df = self._filter(df)
         return df
 
     def _run_multiple(self, files:List[Path]) -> pl.LazyFrame:
@@ -84,7 +82,6 @@ class BaseReader(ABC):
             ])
             if self._should_group and self.duplicate_group_when == "by_run":
                 dfs = self.grouper.run(dfs)
-        dfs = self._filter(dfs)
         return dfs
 
     def _read_header(self, f: Path) -> List[str]:
@@ -168,15 +165,6 @@ class BaseReader(ABC):
         - Keep any failed rows for QC purposes
         """
         pass
-
-    def _filter(self, df:pl.LazyFrame) -> pl.LazyFrame:
-        """
-        Apply any necessary filters to the dataframe, such as removing non-functional TCRs or singlets
-        """
-        if self.filterer is not None:
-            df = self.filterer.run(df)
-        return df
-    
 
 
 class MixcrReader(BaseReader):
