@@ -21,12 +21,19 @@ DATASET_VERSION = 4   # v4: per-repertoire hive layout — processed_repertoires
                       # v2: all operation outputs live under operations/ (per-op operation.json);
                       # v1 = the pre-restructure layout (scattered op outputs + meta/operations.json)
 
+IMGT_VERSION = "202614-2 (31 March 2026)"  # data releseas: https://www.imgt.org/IMGT_vquest/data_releases
+
 
 @dataclass(frozen=True)
 class Manifest:
     version: int = 0                    # 0 == pre-versioning dataset (no manifest on disk)
     tcrio_version: str = ""             # library version that last wrote it
     present_loci: List[str] = field(default_factory=list)   # loci in this dataset, fixed at ingest
+    # Filter provenance recorded at ingest: {"<LOCUS>": <set>, ...} — one entry per accepted locus,
+    # where each <set> is {"preset": <name|null>, "filters": [<filter names>]}. Loci absent from the
+    # map were not accepted (all rows filtered). Empty for pre-provenance datasets -> report falls
+    # back to the default preset.
+    filters: dict = field(default_factory=dict)
 
     @classmethod
     def read(cls, path: str | Path) -> "Manifest":
@@ -38,9 +45,10 @@ class Manifest:
         return cls(**{k: v for k, v in data.items() if k in known})   # forward-compatible
 
     @classmethod
-    def current(cls, present_loci: List[str] | None = None) -> "Manifest":
+    def current(cls, present_loci: List[str] | None = None,
+                filters: dict | None = None) -> "Manifest":
         return cls(version=DATASET_VERSION, tcrio_version=_tcrio_version,
-                   present_loci=sorted(present_loci or []))
+                   present_loci=sorted(present_loci or []), filters=filters or {})
 
     def write(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2))
