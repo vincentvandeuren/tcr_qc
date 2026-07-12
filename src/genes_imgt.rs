@@ -16,6 +16,9 @@ pub enum TcrChain {
     TRB,
     TRG,
     TRD,
+    IGH,
+    IGK,
+    IGL,
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TcrGeneType {
@@ -52,6 +55,9 @@ impl TcrChain {
             "TRB" => Ok(TcrChain::TRB),
             "TRG" => Ok(TcrChain::TRG),
             "TRD" => Ok(TcrChain::TRD),
+            "IGH" => Ok(TcrChain::IGH),
+            "IGK" => Ok(TcrChain::IGK),
+            "IGL" => Ok(TcrChain::IGL),
             other => Err(format!("Unknown chain: '{}'", other)),
         }
     }
@@ -72,7 +78,7 @@ fn parse_gene_ref() -> impl Iterator<Item = Result<TcrData, String>> {
     let content = std::str::from_utf8(GENE_REF).expect("GENE_REF is not valid UTF-8");
 
     // Skip the header line, then parse each subsequent line
-    // Expected columnes : 0.organism, 1.name, 2.chain, 3.gene_type, 4.gene, 5.sequence_nt, 6.cdr3_part_nt, 7.is_functional
+    // Expected columns : 0.species, 1.gene_type, 2.name, 3.gene, 4.chain, 5.sequence_nt, 6.cdr3_part_nt, 7.is_functional
     content
         .lines()
         .skip(1)
@@ -85,10 +91,10 @@ fn parse_gene_ref() -> impl Iterator<Item = Result<TcrData, String>> {
             }
 
             let organism = Organism::parse(fields[0])?;
-            let id_str = fields[1].to_string();
-            let chain = TcrChain::parse(fields[2])?;
-            let gene_type = TcrGeneType::parse(fields[3])?;
-            let gene = fields[4].to_string();
+            let gene_type = TcrGeneType::parse(fields[1])?;
+            let id_str = fields[2].to_string();
+            let gene = fields[3].to_string();
+            let chain = TcrChain::parse(fields[4])?;
             let sequence_nt = fields[5].to_string().to_ascii_lowercase();
             let cdr3_sequence_nt = fields[6].to_string().to_ascii_lowercase();
             let is_functional = fields[7] == "true";
