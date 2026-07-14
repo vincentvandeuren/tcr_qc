@@ -1,41 +1,3 @@
-"""
-Dataset structure
-
-The authoritative, machine-readable definition of this layout lives in `tcr_io/layout.py`
-(the `Layout` registry). The tree below is illustrative only — resolve paths via
-`Layout.<key>.path`, never by hardcoding these strings.
-
-my_dataset/
-├── processed_repertoires/      # One directory per repertoire, hive-partitioned by locus.
-│   ├── sample_001/             # Written in one pl.PartitionBy streaming pass.
-│   │   ├── locus=TRB/sample_001.parquet   # Standardized schema; locus is in the PATH, not the file.
-│   │   ├── locus=TRA/sample_001.parquet
-│   │   └── locus=_unassigned/sample_001.parquet   # QC: rows with no derivable locus (excluded from loci).
-│   └── sample_002/
-│       └── locus=TRB/sample_002.parquet
-│
-├── meta/                       # Canonical dataset tables ONLY (no op outputs).
-│   ├── generation.json # One row per dataset generation. Metadata about when, how, source, etc.
-│   ├── repertoire/
-│   │   ├── TRB.parquet         # One row per repertoire in this locus. IDs, counts, source files, patient_ids.
-│   │   ├── TRA.parquet         # One meta table per present locus (Option C).
-│   │   └── repertoire_meta.parquet # Optional, additional metadata about repertoires (e.g. source, processing notes). Must have repertoire_id column to join.
-│   ├── patient/
-│   │   ├── patient.parquet     # One row per patient. Aggregated stats.
-│   │   ├── patient_meta.parquet     # Optional, additional metadata about patients (e.g. clinical notes). Must have patient_id column to join with patient.parquet.
-│   │   └── hla.parquet         # Optional. Known (real) HLA typing. Inferred HLA is an op result under operations/.
-│   └── publication/
-│       ├── publication_ids.json # DOI(s), pubmed_id(s) or other identifiers for publications associated with this dataset.
-│       ├── pdfs                # optional, generated or manually added publication PDFs.
-│       └── publication.parquet # Generated,fetched metadata cached here
-│
-├── operations/                 # Generated. All operation results, one dir per op.
-│   └── <op_name>/
-│       ├── operation.json      # Self-describing per-op record (version, params, outputs, loci, ...).
-│       └── [<LOCUS>/]<output>.<ext>   # Named outputs; locus segment for locus-aware ops.
-│
-└── README.md                   # Optional. Auto-generated dataset card.
-"""
 from __future__ import annotations
 from functools import cached_property
 from dataclasses import asdict
@@ -636,7 +598,11 @@ class TcrDataset:
         return self.repertoire_meta().select(pl.sum("n_clonotypes"))[0, 0]
     
     def __repr__(self):
-        return f"TcrDataset \'{self.db_name}\', created_on {self.generation_meta['created_on']}, {self.n_clonotypes} clonotypes ({self.n_repertoires} repertoires, {self.n_patients} patients)."
+        return f"""Processed Dataset \'{self.db_name}\', dataset v{self.version}, 
+        present loci {sorted(self._present_loci())},
+        created_on {self.generation_meta['created_on']}, 
+        {self.n_clonotypes} clonotypes ({self.n_repertoires} repertoires, {self.n_patients} patients),
+        """
 
 
 class OperationResultsNamespace:
