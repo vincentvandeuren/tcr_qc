@@ -28,11 +28,15 @@ def trim_junction_to_cdr3(
 def to_imgt(
         gene_col = pl.col("v_call"), 
         # invalid_handling:Literal["keep_original", "null"]="keep_original",
-        split_on_character:Optional[str]=None
+        split_on_character:Optional[str]=None,
+        fix_dv: bool=True
         ) -> pl.Expr:
     if split_on_character is None:
         split_on_character = ""
-    return _map_gene_alias(gene_col, split_on_character) # todo add invalid handling
+    if fix_dv:
+        gene_col = gene_col.str.replace(r"(TRAV\d+(?:-\d+)?)[\\/]?DV", "${1}/DV")
+
+    return _map_gene_alias(gene_col, split_on_character)
 
 def is_valid_junction_aa(
         junction_aa = pl.col("junction_aa"),
