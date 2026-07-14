@@ -433,4 +433,8 @@ class ReaderFactory:
     
     def __repr__(self):
         return f"ReaderFactory, last_resolved_reader={self.last_resolved_reader_}"
+    
+    @property
+    def name(self):
+        return self.last_resolved_reader_.name + " (inferred)" if self.last_resolved_reader_ else "unresolved"
 
