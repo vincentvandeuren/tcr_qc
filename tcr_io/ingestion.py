@@ -145,13 +145,16 @@ class DatasetIngester:
         reorder and desync the positional id (see docs/clonotype_id_implementation_plan.md §3).
         Returns the set of real loci written across all repertoires (excluding `_unassigned`)."""
         present: set = set()
-        for repertoire_id, files in tqdm(repertoires.items(), desc="Reading repertoires"):
+        pbar = tqdm(repertoires.items(), desc="Reading repertoires")
+
+        for repertoire_id, files in pbar:
             df = self.reader.run(files).with_columns(
                 pl.lit(repertoire_id).alias("repertoire_id"),
                 assign_locus(),                          # partition key; unknown/mismatch -> _unassigned
             ).pipe(                                       # locus-aware quality filter -> filter_pass
                 self.filter_set.run                      # (_unassigned rows forced to fail)
             )
+
 
             base = self.db_dir / repertoire_dir_relpath(repertoire_id)
             partition = pl.PartitionBy(
@@ -177,7 +180,14 @@ class DatasetIngester:
                    .select([*REPERTOIRE.keys(), "locus"])
                    .sink_parquet(partition))
 
-            present |= self._loci_written(base)
+            loci_written = self._loci_written(base)
+            present |= loci_written
+
+            loci_for_print = sorted([l for l in loci_written if l != "_unassigned"])
+
+            # update pbar with reader
+            pbar.set_postfix_str(f"Reader: {self.reader.name}, {"+".join(loci_for_print)}")
+
         present.discard(UNASSIGNED)
         return present
 
