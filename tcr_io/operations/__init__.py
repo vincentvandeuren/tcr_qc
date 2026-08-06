@@ -10,3 +10,4 @@ from .gene_freqs import GeneCountsSummary
 from .cmv_hits import ECOClusterHits
 from .unconventional_tcrs import MaitHits
 from .rarefaction import RarefactionReport
+from .fisher import FisherAssociation, FisherTest
