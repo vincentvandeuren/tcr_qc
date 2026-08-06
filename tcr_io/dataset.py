@@ -24,6 +24,7 @@ from .structure import (
     write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION, CLONE_TO_CELL,
 )
 from .structure import schema as _schema
+from .structure import meta_edit
 from .expressions import UNASSIGNED
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,14 @@ def _output_kind(result) -> Kind:
     raise TypeError(f"Unsupported operation output type: {type(result)!r}")
 
 
+def _fmt_ids(ids: List[str], cap: int = 10) -> str:
+    """Render a (possibly long) id list for a warning/error message, capped with an ellipsis."""
+    shown = [str(i) for i in ids[:cap]]
+    if len(ids) > cap:
+        shown.append(f"... (+{len(ids) - cap} more)")
+    return "[" + ", ".join(shown) + "]"
+
+
 def _read_output(path: Path, kind: str):
     if kind == Kind.PARQUET.value:
         return pl.read_parquet(path)
@@ -59,8 +68,11 @@ def _read_output(path: Path, kind: str):
 
 class TcrDataset:
     """
-    Thin read-only handle to a TCR dataset directory.
-    Knows structure. Provides accessors. No mutation logic.
+    Handle to a TCR dataset directory. Knows structure; provides accessors.
+
+    Mostly read-through (every accessor reads from disk on demand), but it also owns the few
+    supported mutations: ``migrate`` (version upgrade), ``run_operation`` (generated results),
+    and the ``set_patient_meta`` / ``set_repertoire_meta`` / ``set_hla`` side-metadata writers.
     """
 
     def __init__(self, db_dir:str|Path):
@@ -386,6 +398,119 @@ class TcrDataset:
             pat = pat.join(pl.read_parquet(hla), on="patient_id", how="left")
 
         return pat
+
+    # ── side-metadata writers ────────────────────────────────────────────────────
+    # Populate the optional tables that `full_*_meta` joins in. Ideally done during/right after
+    # ingestion, but supported at any time. See docs/superpowers/specs/2026-07-15-metadata-write-api-design.md.
+
+    def set_patient_meta(self, df: pl.DataFrame, *, mode: str = "merge") -> None:
+        """Write extra per-patient metadata (keyed on ``patient_id``), joined into
+        ``full_patient_meta``. ``mode='merge'`` (default) adds new columns/rows without touching
+        existing columns; ``mode='replace'`` overwrites the whole table. See `_set_free_form_meta`
+        for the validation rules."""
+        self._set_free_form_meta(
+            df, key="patient_id", artifact=Layout.patient_meta_extra,
+            base=self.patient_meta, mode=mode, label="set_patient_meta",
+        )
+
+    def set_repertoire_meta(self, df: pl.DataFrame, *, mode: str = "merge") -> None:
+        """Write extra per-repertoire metadata (keyed on ``repertoire_id``), joined into
+        ``full_repertoire_meta`` across every locus. The extra table is locus-agnostic (one row
+        per ``repertoire_id``), so there is no ``locus`` argument. Semantics as `set_patient_meta`."""
+        self._set_free_form_meta(
+            df, key="repertoire_id", artifact=Layout.repertoire_meta_extra,
+            base=self.repertoire_meta(), mode=mode, label="set_repertoire_meta",
+        )
+
+    def _set_free_form_meta(self, df: pl.DataFrame, *, key: str, artifact, base: pl.DataFrame,
+                            mode: str, label: str) -> None:
+        """Shared write path for the two free-form extra tables.
+
+        Validates (duplicate keys -> raise; unknown/missing keys -> warn; columns already present
+        in the base or existing-extra table -> warn + drop), then writes. ``mode='replace'``
+        overwrites; ``mode='merge'`` additively joins the surviving new columns onto the existing
+        table (adding new rows), leaving existing columns untouched."""
+        if mode not in ("merge", "replace"):
+            raise ValueError(f"{label}: mode must be 'merge' or 'replace', got {mode!r}.")
+        if key not in df.columns:
+            raise ValueError(f"{label}: input is missing the '{key}' key column.")
+
+        self._validate_meta_keys(df, key=key, base_keys=base.get_column(key).unique().to_list(), label=label)
+
+        path = self.db_dir / artifact.path
+        existing = pl.read_parquet(path) if (mode == "merge" and path.exists()) else None
+
+        reserved = list(base.columns) + (existing.columns if existing is not None else [])
+        collisions = meta_edit.reserved_column_collisions(df.columns, reserved, key)
+        if collisions:
+            warnings.warn(
+                f"{label}: column(s) {collisions} already exist in the metadata and were skipped; "
+                f"use mode='replace' to overwrite them.",
+                stacklevel=3,
+            )
+            df = df.drop(collisions)
+
+        out = df if existing is None else meta_edit.merge_frames(existing, df, key)
+        write_artifact(artifact, out, self.db_dir)
+
+    def set_hla(self, df: pl.DataFrame) -> None:
+        """Write ground-truth HLA typing (keyed on ``patient_id``), joined into
+        ``full_patient_meta``. Always a full **replace** — HLA's fixed 8-column schema
+        (`schema.HLA_META`) has no room for a column-adding merge.
+
+        Input must already be in canonical notation (bare 4-digit allele strings per locus). Absent
+        loci columns are filled with null-lists (partial typing allowed); columns outside the schema
+        are warned and dropped; `write_artifact` casts to `HLA_META` (a wrong dtype raises). Standard
+        key validation applies (duplicate -> raise, unknown/missing -> warn)."""
+        key = "patient_id"
+        label = "set_hla"
+        if key not in df.columns:
+            raise ValueError(f"{label}: input is missing the '{key}' key column.")
+
+        self._validate_meta_keys(df, key=key, base_keys=self.patient_meta.get_column(key).to_list(), label=label)
+
+        extra_cols = [c for c in df.columns if c not in _schema.HLA_META]
+        if extra_cols:
+            warnings.warn(
+                f"{label}: column(s) {extra_cols} are not part of the HLA schema and were dropped.",
+                stacklevel=2,
+            )
+        # Enforce pre-parsed alleles explicitly: a plain-string locus column would otherwise be
+        # silently wrapped into a 1-element list by the cast ("0201" -> ["0201"]), masking a
+        # notation mistake. set_hla does no parsing, so require List columns up front.
+        non_list = [c for c in _schema.HLA_META if c != key and c in df.columns
+                    and not isinstance(df.schema[c], pl.List)]
+        if non_list:
+            raise ValueError(
+                f"{label}: HLA locus column(s) {non_list} must be List(str) of pre-parsed 4-digit "
+                f"alleles, got {[str(df.schema[c]) for c in non_list]}. set_hla does not parse notation."
+            )
+        missing_loci = [c for c in _schema.HLA_META if c != key and c not in df.columns]
+        if missing_loci:
+            df = df.with_columns([pl.lit(None, dtype=pl.List(pl.Utf8)).alias(c) for c in missing_loci])
+
+        write_artifact(Layout.hla, df, self.db_dir)   # select+cast enforces HLA_META
+
+    def _validate_meta_keys(self, df: pl.DataFrame, *, key: str, base_keys: List[str], label: str) -> None:
+        """Duplicate keys -> raise; keys not in the base (unknown) and base entities not in `df`
+        (missing) -> warn. Shared by every setter."""
+        dups = meta_edit.duplicate_keys(df, key)
+        if dups:
+            raise ValueError(f"{label}: duplicate {key} value(s) in input: {_fmt_ids(dups)}.")
+
+        unknown, missing = meta_edit.check_keys(df.get_column(key).to_list(), base_keys)
+        if unknown:
+            warnings.warn(
+                f"{label}: {len(unknown)} {key}(s) not present in the dataset "
+                f"(rows kept but they will not surface in the join): {_fmt_ids(unknown)}.",
+                stacklevel=3,
+            )
+        if missing:
+            warnings.warn(
+                f"{label}: {len(missing)} {key}(s) in the dataset have no row in the input: "
+                f"{_fmt_ids(missing)}.",
+                stacklevel=3,
+            )
 
     @cached_property
     def publication_meta(self) -> dict:

@@ -49,6 +49,22 @@ PUBLICATION_META = pl.Schema({
     "publication_id": pl.Utf8,
 }) # ndjson
 
+# Ground-truth ("known") HLA typing, one row per patient. Each locus column holds the
+# patient's alleles as bare 4-digit strings (e.g. ["0201", "2902"]); an untyped locus is a
+# null/empty list. Input must already be parsed to this canonical notation — the write path
+# does no parsing, it only validates the container/dtype. Joined into `full_patient_meta`.
+HLA_META = pl.Schema({
+    "patient_id": pl.Utf8,
+    "A":    pl.List(pl.Utf8),
+    "B":    pl.List(pl.Utf8),
+    "C":    pl.List(pl.Utf8),
+    "DRB1": pl.List(pl.Utf8),
+    "DPA1": pl.List(pl.Utf8),
+    "DPB1": pl.List(pl.Utf8),
+    "DQA1": pl.List(pl.Utf8),
+    "DQB1": pl.List(pl.Utf8),
+}) # parquet
+
 # Operation provenance is no longer a global polars-schema table. Each op writes a
 # self-describing `operations/<op>/operation.json` (the `OperationRecord` dataclass);
 # see tcr_io/operations/base.py.
