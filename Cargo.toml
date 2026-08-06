@@ -15,3 +15,4 @@ polars = { version = "0.53.0", features=["dtype-struct"], default-features = fal
 polars-arrow = { version = "0.53.0", default-features = false }
 num-traits = "0.2.19"
 aho-corasick = "1.1.4"
+rayon = "1"
