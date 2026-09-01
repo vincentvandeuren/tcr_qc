@@ -1,136 +1,128 @@
+"""`BaseOperation` — what an operation IS.
+
+An operation declares its outputs as `Artifact` class attributes and computes them. It does
+not decide where it writes, whether it needs to run, or what happens when it raises: that is
+all `OperationRunner`.
+"""
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields, is_dataclass
-from datetime import datetime
-import traceback
-from typing import ClassVar, Dict, List, Optional, Union, TYPE_CHECKING
+from dataclasses import dataclass, fields, is_dataclass
+from typing import ClassVar, List, TYPE_CHECKING
+
 import polars as pl
 
+from ..expressions import KNOWN_LOCI
+from ..structure import Artifact, Format, Store
+from .record import serialize_params
+
 if TYPE_CHECKING:
-    from tcr_io.dataset import TcrDataset
+    from tcr_io.dataset import Dataset
 
 
-# Sentinel for `supported_loci`: run the op once per locus present in the dataset.
-ALL_LOCI = object()
-
-# A single operation output value the framework serialises (parquet/ndjson/json).
-# Unstructured *directory* outputs are NOT values: the op writes them itself into the managed
-# dir handed out by `TcrDataset._operation_output_dir` and they never appear here (see
-# docs/unstructured_output_plan.md).
-Result = Union[pl.DataFrame, pl.LazyFrame, list]
-
-
-@dataclass
-class OperationResults:
-    """Outputs of one `_run`, keyed by output **name** (not path).
-
-    The framework roots each output at ``operations/<op>/[<locus>/]<name>.<ext>`` and
-    writes it by `Kind`.
-    """
-    outputs: Dict[str, Result]
-
-
-@dataclass
-class OperationFailure:
-    error: str
-
-
-@dataclass
-class OutputRecord:
-    """One row of `OperationRecord.outputs` — self-describing so retrieval is deterministic."""
-    name: str
-    path: str                   # relative to the op dir, e.g. "TRB/gene_counts.parquet"
-    kind: str                   # Kind value: "parquet" | "ndjson" | "json" | "unstructured"
-    locus: Optional[str]        # None for locus-agnostic outputs
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "OutputRecord":
-        return cls(name=d["name"], path=d["path"], kind=d["kind"], locus=d.get("locus"))
-
-
-@dataclass
-class OperationRecord:
-    """Serialised to ``operations/<name>/operation.json`` — the per-op ledger.
-
-    Replaces the old global ``meta/operations.json``. Source of truth for skip logic,
-    result retrieval and `ds.rerun`.
-    """
-    operation_name: str
-    version: str
-    description: str
-    ran_at: datetime
-    duration_s: float
-    status: str                     # "success" | "failure"
-    error: Optional[str]
-    params: dict                    # config this op ran with -> rerun defaults
-    loci: Optional[List[str]]       # which loci ran (None for locus-agnostic ops)
-    outputs: List[OutputRecord]
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "OperationRecord":
-        return cls(
-            operation_name=d["operation_name"],
-            version=d["version"],
-            description=d.get("description", ""),
-            ran_at=d.get("ran_at"),
-            duration_s=d.get("duration_s"),
-            status=d["status"],
-            error=d.get("error"),
-            params=d.get("params") or {},
-            loci=d.get("loci"),
-            outputs=[OutputRecord.from_dict(o) for o in d.get("outputs", [])],
-        )
+# `supported_loci` is a plain frozenset intersected with what the runner offers — no sentinel,
+# and no `None`. "Every locus" is spelled `KNOWN_LOCI`, and unlike a sentinel it can be unioned
+# with `UNASSIGNED`, which `FilteringReport` needs. The `None` third state meant "locus-agnostic,
+# one pass"; no shipped operation is, since publication fetching became a metadata writer, so it
+# bought a branch in the runner, in `loci_to_run`, in `Store.with_root` and in every reader of a
+# record's `locus` — for a case that does not exist.
 
 
 class BaseOperation(ABC):
-    """A generated-result computation over a `TcrDataset`.
+    """A generated-result computation over a `Dataset`.
 
     Concrete ops are `@dataclass`es whose **annotated** fields are config; the metadata
     attributes below stay **unannotated** on purpose so the dataclass never treats them as
-    fields (annotate config, leave metadata bare — see base_operation_design.md §2).
-    Resources (models, reference frames) load in `__post_init__` as plain attributes → not
-    fields → excluded from `params()`.
+    fields. Resources (models, reference frames) load in `__post_init__` as plain attributes
+    -> not fields -> excluded from `params()`.
+
+    Outputs are `Artifact` class attributes. That is the whole output declaration: it gives
+    each output a name (the attribute), a path shape, a format and a schema in one place, and
+    it makes a typo an `AttributeError` at the write site instead of a lookup failure at the
+    read site three weeks later.
     """
     name = "base_operation"
     version = "0.0"
     description = "Base operation - does nothing"
-    # None -> locus-agnostic (one pass); ALL_LOCI -> per present locus; frozenset({"TRB"}) -> subset
-    supported_loci: ClassVar[Union[frozenset, object, None]] = None
+    # Intersected with the loci the dataset offers. The default runs on every real locus;
+    # narrow it (`frozenset({"TRB"})`) or widen it (`KNOWN_LOCI | {UNASSIGNED}`) per op.
+    supported_loci: ClassVar[frozenset] = KNOWN_LOCI
 
     @abstractmethod
-    def _run(self, ds: "TcrDataset", locus: Optional[str] = None) -> OperationResults:
-        """Compute outputs for one locus (or the whole dataset when locus is None),
-        returned keyed by *name*; the framework assigns paths + writes them."""
+    def _run(self, ds: "Dataset", out: Store) -> None:
+        """Compute and write this pass's outputs.
+
+        `ds` is already bound to the pass's locus (or unbound for a locus-agnostic op), so
+        every locus-grain read inside needs no locus argument. `out` is a Store rooted at
+        this pass's output directory: `out(SOME_ARTIFACT).write(frame)`, or for a directory
+        artifact `out(SOME_DIR).clear()` and write into the returned path.
+
+        Writing is the op's own act rather than a value it returns, so a table output and a
+        directory output are produced the same way — the old `_pending_unstructured` list
+        existed only because they were not. The runner discovers what was written by globbing
+        the declared artifacts afterwards.
+
+        RAISES on failure. There is no `run()` wrapper and no `OperationFailure`: those were
+        a wrapper class, a union return type and a branch, all to move a try/except down one
+        level. The runner catches.
+        """
+
+    @classmethod
+    def artifacts(cls) -> tuple:
+        """Every output this operation declares.
+
+        Walks `reversed(cls.__mro__)` so a subclass override wins, then insists that each
+        surviving artifact was declared by `cls` itself. Outputs belong to the class that
+        RUNS: an inherited artifact would carry its base class's `owner`, and `ds.result()`
+        resolves an output's directory from `owner.name` — so a shared declaration would send
+        every subclass's results to the base class's folder.
+        """
+        found = {}
+        for klass in reversed(cls.__mro__):
+            found.update({k: v for k, v in vars(klass).items() if isinstance(v, Artifact)})
+        stolen = [a for a in found.values() if a.owner is not cls]
+        if stolen:
+            raise TypeError(
+                f"{cls.__name__} inherits output(s) "
+                f"{[a.key for a in stolen]} from {stolen[0].owner.__name__}; declare them on "
+                f"{cls.__name__} so they are written and read under {cls.name!r}."
+            )
+        return tuple(found.values())
 
     def params(self) -> dict:
-        """Serialisable config this op ran with (dataclass fields). Empty for non-dataclass ops."""
+        """The config this ran with — rebuild defaults, and part of run identity. Empty for a
+        non-dataclass op. Serialized here so the value a record stores and the value it is
+        compared against are the same value."""
         if not is_dataclass(self):
             return {}
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        return serialize_params({f.name: getattr(self, f.name) for f in fields(self)})
 
-    def loci_to_run(self, present: frozenset) -> List[Optional[str]]:
-        if self.supported_loci is None:
-            return [None]
-        if self.supported_loci is ALL_LOCI:
-            return sorted(present)
-        return sorted(self.supported_loci & present)
+    def loci_to_run(self, offered: frozenset) -> List[str]:
+        """This op's loci that the dataset actually offers — `offered` is `ds.dispatch_loci`.
 
-    def run(self, ds: "TcrDataset", locus: Optional[str] = None) -> Union[OperationResults, OperationFailure]:
-        try:
-            return self._run(ds, locus)
-        except Exception as e:
-            return OperationFailure(error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        Not an override point: fan-out is runner policy, and with `_unassigned` expressible in
+        `supported_loci` there is no longer a reason to want one.
+        """
+        return sorted(self.supported_loci & offered)
 
 
 @dataclass
-class TestNullOperation(BaseOperation):
-    name = "test_null_operation"
-    version = "0.1"
-    description = "Test operation that creates some empty output"
+class NullOperation(BaseOperation):
+    """The smallest complete operation: one table, no config.
 
-    def _run(self, ds: "TcrDataset", locus: Optional[str] = None) -> OperationResults:
-        filter_pass = ds.repertoire_meta(locus).with_columns(
-            filter_pass_pct=pl.col("n_clonotypes") / pl.col("n_clonotypes").add(pl.col("n_filtered_clonotypes"))
-        ).select(["repertoire_id", "filter_pass_pct"])
+    Lives here rather than in the tests because it is the worked example of the contract —
+    declare an Artifact, write through `out`, return nothing.
+    """
+    name = "null_operation"
+    version = "0.2"
+    description = "Per-repertoire fraction of clonotypes that passed ingest filtering."
 
-        return OperationResults(outputs={"filter_pass": filter_pass})
+    pass_rate = Artifact("pass_rate.parquet", Format.PARQUET)
+
+    def _run(self, ds: "Dataset", out: Store) -> None:
+        out(self.pass_rate).write(
+            ds.repertoire_counts
+            .with_columns(pass_pct=pl.col("n_clonotypes")
+                          / pl.col("n_clonotypes").add(pl.col("n_filtered_clonotypes")))
+            .select(["repertoire_id", "pass_pct"])
+        )

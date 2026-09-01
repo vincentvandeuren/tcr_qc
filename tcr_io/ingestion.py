@@ -10,14 +10,12 @@ from datetime import datetime
 import shutil
 
 
-from .dataset import TcrDataset
+from .dataset import Dataset
+from ._internal import __version__ as _tcrio_version
 from .expressions import assign_locus, UNASSIGNED
 from .filters import FilterSet, PerLocusFilterSet
-from .structure import (
-    Layout, REQUIRED_DIRS, GENERATED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath,
-    clone_to_cell_relpath, loci_glob, repertoire_meta_relpath, Manifest,
-    REPERTOIRE, REPERTOIRE_META, PATIENT_META, GENERATION_META, PUBLICATION_META, CLONE_TO_CELL,
-)
+from .structure import layout, Store, Manifest
+from .structure import schema as s
 
 
 logger = logging.getLogger(__name__)
@@ -45,20 +43,26 @@ class DatasetIngester:
         reader: BaseReader | ReaderFactory | None = None,
         publication_ids : List[str] | None = None,
         allow_overwrite: bool = False,
-        filter_set: FilterSet | PerLocusFilterSet | None = None,
+        filter_set: FilterSet | PerLocusFilterSet | str | None = None,
     ):
         self.db_dir = (Path(db_dir) / db_name).resolve()
+        self.store = Store(self.db_dir)      # every path this ingester writes resolves through here
         self.reader = reader or ReaderFactory()
         self.repertoire_mapper = repertoire_mapper
         self.patient_mapper = patient_mapper
         self.db_name = db_name
         self.publication_ids = publication_ids or []
         self.allow_overwrite = allow_overwrite
-        # Quality filters run AFTER locus assignment (locus-aware). A plain FilterSet is applied
-        # uniformly to every known locus; None -> the default TR preset over every known locus.
+        # Quality filters run AFTER locus assignment (locus-aware). A preset NAME is the
+        # intended interface — it is the one thing in the ingest record that re-runs — so it
+        # is accepted directly; a dataset needing different cleaning gets a preset registered
+        # rather than a FilterSet assembled here. A plain FilterSet is applied uniformly to
+        # every known locus; None -> the default TR preset.
         if filter_set is None:
-            filter_set = PerLocusFilterSet.uniform(FilterSet.named("default_trb"))
-        elif isinstance(filter_set, FilterSet):
+            filter_set = "default_trb"
+        if isinstance(filter_set, str):
+            filter_set = FilterSet.named(filter_set)
+        if isinstance(filter_set, FilterSet):
             filter_set = PerLocusFilterSet.uniform(filter_set)
         self.filter_set = filter_set
 
@@ -72,8 +76,9 @@ class DatasetIngester:
                 logger.warning(f"Dataset directory {self.db_dir} already exists and will be overwritten.")
                 self._delete_existing_data() # clears processed_repertoires + stale operation outputs
 
-        for subdir in REQUIRED_DIRS + GENERATED_DIRS:
-            (self.db_dir / subdir).mkdir(parents=True, exist_ok=True)
+        # The directories every dataset must have, derived from the artifact table rather
+        # than listed here — so a new artifact cannot land without its home.
+        self.store.create_tree(layout.ARTIFACTS)
 
         
     def _create_mapping(self, dir:Path|str):
@@ -106,7 +111,7 @@ class DatasetIngester:
 
         return data, skipped_files
     
-    def run(self, dir:Path|str) -> TcrDataset:
+    def run(self, dir:Path|str) -> Dataset:
         logger.info(f"Processing dataset {self.db_name} from {dir}...")
         self._create_structure()
         logger.info("Creating mappings...")
@@ -114,28 +119,23 @@ class DatasetIngester:
         logger.info(f"Mapping created. {len(repertoires)} repertoires mapped from {len(set(repertoires_to_patients.values()))} unique patients, {len(skipped)} files skipped.")
         present_loci = self._process_repertoires(repertoires)   # loci actually written (excl. _unassigned)
         self._generate_repertoire_metadata(repertoires, repertoires_to_patients, present_loci)
-        self._generate_patient_metadata(repertoires_to_patients).write_parquet(
-            self.db_dir / Layout.patient_meta.path
-        )
-        self._generate_publication_metadata().write_ndjson(
-            self.db_dir / Layout.publication_ids.path
-        )
-        self._generate_generation_metadata(dir).write_ndjson(
-            self.db_dir / Layout.generation_meta.path
-        )
-        # operations/ is created empty by _create_structure (a GENERATED_DIR); ops fill it
+        self.store(layout.PATIENT_META).write(self._generate_patient_metadata(repertoires_to_patients))
+        self.store(layout.PUBLICATION_IDS).write(self._generate_publication_metadata())
+        self.store(layout.GENERATION_META).write(self._generate_generation_metadata(dir))
+        # operations/ is created by the first operation that writes into it; ops fill it
         # on demand with per-op operation.json records — there is no global ledger to seed.
-        Manifest.current(
-            present_loci=sorted(present_loci),
-            filters=self.filter_set.provenance(),   # record the exact set(s) used, per locus
-        ).write(self.db_dir / Layout.manifest.path)
+        # The manifest records what cannot be read off the tree, and that is the version and
+        # nothing else. Which loci a dataset holds can be read — `processed_repertoires/locus=*/`
+        # — and how it was ingested is the ingest record's job, one line up.
+        Manifest.current().write(self.store)
 
         logger.info("Dataset processing complete.")
-        return TcrDataset(self.db_dir)
+        return Dataset(self.db_dir)
     
     def _process_repertoires(self, repertoires) -> set:
-        """Write each repertoire partitioned by locus (``{id}/locus={LOCUS}/{id}.parquet``); rows
-        with no derivable locus ride the ``locus=_unassigned/`` partition (see `assign_locus`).
+        """Write each repertoire's rows into the locus-first tree
+        (``processed_repertoires/locus={LOCUS}/{id}.parquet``); rows with no derivable locus ride
+        the ``locus=_unassigned/`` partition (see `assign_locus`).
         ``clonotype_id`` is a per-``(repertoire, locus)`` row number (``int_range().over("locus")``),
         so identity is ``(repertoire_id, locus, clonotype_id)`` — the hive grain.
 
@@ -151,93 +151,92 @@ class DatasetIngester:
             df = self.reader.run(files).with_columns(
                 pl.lit(repertoire_id).alias("repertoire_id"),
                 assign_locus(),                          # partition key; unknown/mismatch -> _unassigned
-            ).pipe(                                       # locus-aware quality filter -> filter_pass
-                self.filter_set.run                      # (_unassigned rows forced to fail)
+            ).pipe(                                       # locus-aware quality filter ->
+                self.filter_set.run                      # filter_reason (null == passed)
             )
 
-
-            base = self.db_dir / repertoire_dir_relpath(repertoire_id)
+            safe_id = layout.safe_repertoire_name(repertoire_id)
+            written: set = set()
             partition = pl.PartitionBy(
-                str(base), key=["locus"], include_key=False,   # locus is the path, not a column
-                file_path_provider=self._locus_file_provider(repertoire_id),
+                # One base for the whole dataset: the repertoire is the leaf filename now, not a
+                # directory level, so polars is told where the tree starts and the provider says
+                # where each file lands. (polars enforces that the provider's path start here.)
+                str(self.store(layout.PROCESSED_DIR).path()), key=["locus"], include_key=False,
+                file_path_provider=self._locus_file_provider(repertoire_id, written),
             )
             clonotype_id = pl.int_range(pl.len(), dtype=pl.UInt32).over("locus")
 
             if df.collect_schema().get("cell_id") == pl.List(pl.Utf8):
                 # single-cell: collect ONCE, then both artifacts share this row order / id assignment
                 grouped = df.collect(engine="streaming").with_columns(clonotype_id=clonotype_id)
-                grouped.select([*REPERTOIRE.keys(), "locus"]).write_parquet(partition)
+                grouped.select([*s.REPERTOIRE.keys(), "locus"]).write_parquet(partition)
 
-                ctc_path = self.db_dir / clone_to_cell_relpath(repertoire_id)
-                ctc_path.parent.mkdir(parents=True, exist_ok=True)   # lazy: meta/clone_to_cell only if single-cell
-                (grouped.select("repertoire_id", "locus", "clonotype_id", "cell_id")
-                        .explode("cell_id")
-                        .select(CLONE_TO_CELL.keys()).cast(CLONE_TO_CELL)
-                        .write_parquet(ctc_path))
+                # lazy: meta/clone_to_cell exists only for single-cell (write() mkdir -p's it)
+                self.store(layout.CLONE_TO_CELL, repertoire_id=safe_id).write(
+                    grouped.select("repertoire_id", "locus", "clonotype_id", "cell_id")
+                           .explode("cell_id"))
             else:
                 # bulk: fully streamed single sink; clonotype_id numbered within each locus partition
                 (df.with_columns(clonotype_id=clonotype_id)
-                   .select([*REPERTOIRE.keys(), "locus"])
+                   .select([*s.REPERTOIRE.keys(), "locus"])
                    .sink_parquet(partition))
 
-            loci_written = self._loci_written(base)
-            present |= loci_written
-
-            loci_for_print = sorted([l for l in loci_written if l != "_unassigned"])
+            present |= written
 
             # update pbar with reader
-            pbar.set_postfix_str(f"Reader: {self.reader.name}, {"+".join(loci_for_print)}")
+            pbar.set_postfix_str(
+                f"Reader: {self.reader.name}, {"+".join(sorted(written - {UNASSIGNED}))}")
 
         present.discard(UNASSIGNED)
         return present
 
-    def _locus_file_provider(self, repertoire_id):
+    def _locus_file_provider(self, repertoire_id, written: set):
         """`file_path_provider` for `PartitionBy`: name each partition's file `{id}.parquet` under
-        its `locus={value}/` hive dir (rather than polars' `00000000.parquet`)."""
+        its `locus={value}/` hive dir (rather than polars' `00000000.parquet`).
+
+        It is also the only thing that can say which loci THIS repertoire produced, and adds each
+        to `written` as it goes: the partitions all share one base directory now, so a
+        `locus=*` listing would answer for every repertoire ingested so far.
+        """
         def provider(args):
             locus = args.partition_keys.item()          # the single partition value for this file
-            out = self.db_dir / repertoire_locus_relpath(repertoire_id, locus)
+            written.add(locus)
+            out = self.store(layout.REPERTOIRE_FILE,
+                             repertoire_id=layout.safe_repertoire_name(repertoire_id),
+                             locus=locus).path()
             out.parent.mkdir(parents=True, exist_ok=True)
             return out
         return provider
 
-    @staticmethod
-    def _loci_written(base) -> set:
-        """Locus values a repertoire produced, from its `locus=<v>/` partition dirs."""
-        return {p.name.split("=", 1)[1] for p in base.glob("locus=*") if p.is_dir()}
-
     def _generate_repertoire_metadata(self, repertoires, repertoires_to_patients, present_loci) -> None:
-        """Write one `repertoire_meta` parquet per locus (Option C). Each keeps the
-        `REPERTOIRE_META` schema (one row per repertoire_id present in that locus)."""
-        base = pl.DataFrame({
+        """Two grains, two tables.
+
+        `meta/repertoire/repertoire.parquet` is what is true of a repertoire whichever locus you
+        look at — its source files, its patient — written once. `locus={L}/counts.parquet` holds
+        the counts, which mean nothing outside a locus, and exists only for the loci that
+        repertoire actually produced. The single per-locus table this replaces copied the
+        invariant half into every locus, so a patient_id fix had to be applied seven times.
+        """
+        self.store(layout.REPERTOIRE_META).write(pl.DataFrame({
             "repertoire_id": list(repertoires.keys()),
             "source_files": [[f.name for f in files] for files in repertoires.values()],
-            "patient_id" : [repertoires_to_patients[rep_id] for rep_id in repertoires.keys()]
-        })
+            "patient_id": [repertoires_to_patients[rep_id] for rep_id in repertoires],
+        }))
 
         for locus in sorted(present_loci):   # present_loci already excludes _unassigned
-            rep_sizes = [
+            counts = [
                 pl.scan_parquet(f).select(
                     pl.first("repertoire_id"),
-                    pl.sum("filter_pass").alias("n_clonotypes"),
-                    pl.len().alias("n_filtered_clonotypes"),
-                    pl.sum('duplicate_count').alias("total_duplicates")
-                ).with_columns(
-                    pl.col("n_filtered_clonotypes") - pl.col("n_clonotypes")
+                    pl.col("filter_reason").is_null().sum().alias("n_clonotypes"),
+                    pl.col("filter_reason").is_not_null().sum().alias("n_filtered_clonotypes"),
+                    pl.sum("duplicate_count").alias("total_duplicates"),
                 )
-                for f in self.db_dir.glob(loci_glob(locus))
+                for f in self.store(layout.REPERTOIRE_FILE, locus=locus).glob()
             ]
-            if not rep_sizes:
+            if not counts:
                 continue
-            rep_sizes = pl.concat(rep_sizes).collect(engine="streaming")
-
-            # inner join: a repertoire only appears in a locus's meta if it produced that locus.
-            df = base.join(rep_sizes, on="repertoire_id", how="inner").with_columns(
-                pl.col("n_clonotypes").fill_null(0),
-                pl.col("total_duplicates").fill_null(0)
-            ).select(REPERTOIRE_META.keys()).cast(REPERTOIRE_META)
-
-            df.write_parquet(self.db_dir / repertoire_meta_relpath(locus))
+            self.store(layout.REPERTOIRE_COUNTS, locus=locus).write(
+                pl.concat(counts).collect(engine="streaming"))
 
     def _generate_patient_metadata(self, repertoires_to_patients):
 
@@ -251,7 +250,7 @@ class DatasetIngester:
             "n_repertoires": [len(repertoires) for repertoires in repertoires_by_patient.values()]
         })
 
-        return df.select(PATIENT_META.keys()).cast(PATIENT_META)
+        return df
     
 
     def _generate_publication_metadata(self):
@@ -259,26 +258,40 @@ class DatasetIngester:
             "publication_id": self.publication_ids
         })
 
-        return df.select(PUBLICATION_META.keys()).cast(PUBLICATION_META)
+        return df
     
-    def _generate_generation_metadata(self, data_dir: Path):
-        df = pl.DataFrame({
-            "dataset_name" : [self.db_name],
-            "source": [str(data_dir)],
-            "reader" : [self.reader.__repr__()],
-            "repertoire_mapper" : [self.repertoire_mapper.__repr__()],
-            "patient_mapper" : [self.patient_mapper.__repr__()],
-        }).with_columns(
-            pl.lit(datetime.now().date()).alias("created_on")
-        )
-        return df.select(GENERATION_META.keys()).cast(GENERATION_META)
+    def _generate_generation_metadata(self, data_dir: Path) -> dict:
+        """How this dataset was made — the only record of it.
+
+        Ingestion is lossy: the reader normalises columns and the filter set marks rows as
+        excluded, both in place. Nothing downstream can recover what was done, and
+        `filter_reason` records only the filters that FIRED — a filter that rejected nothing
+        leaves no trace in the data. So the set applied is written here, per locus.
+
+        `filters` carries both a preset name and the names it expanded to at write time:
+        the preset is what re-runs, and the expansion stays readable after a later release
+        changes what that preset means. `tcrio_version` is what says which release that was.
+
+        The mappers and reader are `repr` strings — documentation, not deserialisable. The
+        preset name is the one field in here that reproduces rather than describes.
+        """
+        return {
+            "dataset_name": self.db_name,
+            "created_on": datetime.now().date().isoformat(),
+            "source": str(data_dir),
+            "tcrio_version": _tcrio_version,
+            "reader": repr(self.reader),
+            "repertoire_mapper": repr(self.repertoire_mapper),
+            "patient_mapper": repr(self.patient_mapper),
+            "filters": self.filter_set.provenance(),
+        }
     
     def _delete_existing_data(self):
         # Re-ingesting the source data makes every derived operation output stale (its inputs
         # may have changed), so clear operations/ alongside processed_repertoires. Both are
-        # recreated empty by _create_structure; ops recompute on demand into the fresh dir.
-        shutil.rmtree(self.db_dir / Layout.processed_dir.path)
-        ops_dir = self.db_dir / Layout.operations_dir.path
+        # not recreated here; ops recompute on demand and mkdir their own output dir.
+        shutil.rmtree(self.store(layout.PROCESSED_DIR).path())
+        ops_dir = self.db_dir / layout.OPERATIONS_DIR
         if ops_dir.exists():
             shutil.rmtree(ops_dir)
             logger.warning(

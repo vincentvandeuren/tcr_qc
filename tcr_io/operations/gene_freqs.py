@@ -1,8 +1,8 @@
 # copy code from baseline technical features model
-from .base import ALL_LOCI, BaseOperation, OperationResults
-from ..expressions import _determine_reference_points, extract_genes
+from .base import BaseOperation
+from ..structure import Artifact, Format, Store
+from ..expressions import extract_genes
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional
 import polars as pl
 from itertools import product
 
@@ -20,15 +20,20 @@ class GeneCountsSummary(BaseOperation):
     description = "Counts the V and J gene usage frequencies, and computes the surprise of their combinations."
     # TRB-only for now: the gene columns are hardcoded TRBV/TRBJ (for cross-repertoire
     # comparability + missing-gene highlighting). The per-locus functional-gene rewrite lands
-    # in Phase 2, at which point this widens back to ALL_LOCI. See tr_bcr_chain_support plan §2.3.
+    # in Phase 2, at which point this widens back to KNOWN_LOCI. See tr_bcr_chain_support plan §2.3.
     supported_loci = frozenset({"TRB"})
 
+    gene_counts = Artifact("gene_counts.parquet", Format.PARQUET)
+    v_counts    = Artifact("v_counts.parquet", Format.PARQUET)
+    j_counts    = Artifact("j_counts.parquet", Format.PARQUET)
+    vj_bias     = Artifact("vj_bias.parquet", Format.PARQUET)
+    vj_long     = Artifact("vj_long.parquet", Format.PARQUET)
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
+    def _run(self, ds, out: Store) -> None:
         
         vj_table = []
 
-        for repertoire_id, df in ds.iter_repertoires(locus=locus, progress_bar = True, progress_desc="Counting v/j statistics"):
+        for repertoire_id, df in ds.iter_repertoires(progress_bar = True, progress_desc="Counting v/j statistics"):
             vj = df.with_columns(
                 *extract_genes()
             ).group_by(["v_gene", "j_gene"]).agg(pl.len().alias("count")).with_columns(
@@ -93,14 +98,12 @@ class GeneCountsSummary(BaseOperation):
             pl.col(float).fill_null(0).name.prefix("bias_")
         )
 
-        reps = ds.repertoire_meta(locus).select(pl.col("repertoire_id"))
+        reps = ds.repertoire_counts.select(pl.col("repertoire_id"))
         all_broad = reps.join(v_tab, on="repertoire_id", how="left").join(j_tab, on="repertoire_id", how="left").join(vj_surprise_tab, on="repertoire_id", how="left")
 
 
-        return OperationResults(outputs={
-            "gene_counts": all_broad,
-            "v_counts": v_tab,
-            "j_counts": j_tab,
-            "vj_bias": vj_surprise_tab,
-            "vj_long": vj_long,
-        })
+        out(self.gene_counts).write(all_broad)
+        out(self.v_counts).write(v_tab)
+        out(self.j_counts).write(j_tab)
+        out(self.vj_bias).write(vj_surprise_tab)
+        out(self.vj_long).write(vj_long)

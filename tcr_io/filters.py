@@ -6,6 +6,7 @@ import polars as pl
 
 from .expressions import (
     KNOWN_LOCI,
+    UNASSIGNED,
     assign_locus,
     is_functional_tcr,
     is_valid_junction_aa,
@@ -13,7 +14,8 @@ from .expressions import (
 from .structure.version import IMGT_VERSION
 
 
-# name -> class, so a FilterSet can be rebuilt from serialised names (provenance).
+# name -> class. Read by `reason_index()` to describe a stored `filter_reason` value;
+# nothing rebuilds a FilterSet from it (a preset name does that — see FILTER_SET_REGISTRY).
 FILTER_REGISTRY: dict[str, type["BaseFilter"]] = {}
 
 
@@ -153,6 +155,76 @@ class ImgtFunctionalFilter(StructFilter):
 
 
 # ---------------------------------------------------------------------------
+# Reasons that are not filters
+# ---------------------------------------------------------------------------
+
+_V3 = pl.col("v_call").str.slice(0, 3)
+_J3 = pl.col("j_call").str.slice(0, 3)
+
+# Why a row could not be placed on a locus at all and rode the `_unassigned` partition.
+# Ordered — a row is attributed to the FIRST reason it matches (a null v_call is `null_v`,
+# never `unknown_locus`). These are produced by `assign_locus`, not by any FilterSet, which
+# is why they live beside the filters rather than inside one.
+ASSIGNMENT_REASONS: List[FilterReport] = [
+    FilterReport("null_v", pl.col("v_call").is_null(), "v_call",
+                 "V gene call is missing."),
+    FilterReport("null_j", pl.col("j_call").is_null(), "j_call",
+                 "J gene call is missing."),
+    FilterReport("incompatible_locus",
+                 pl.col("v_call").is_not_null() & pl.col("j_call").is_not_null() & (_V3 != _J3),
+                 "v_call", "V and J belong to different loci (e.g. a TRB V with a TRA J)."),
+    FilterReport("unknown_locus",
+                 (_V3 == _J3) & ~_V3.is_in(list(KNOWN_LOCI)),
+                 "v_call", "Gene prefix is not a recognised locus."),
+]
+
+# A row on a real locus that no filter set covers. `PerLocusFilterSet` excludes such rows
+# wholesale, and this is the reason it records for them.
+LOCUS_NOT_ACCEPTED = FilterReport(
+    "locus_not_accepted", pl.lit(True), "v_call",
+    "The row's locus was given no filter set at ingestion, so no quality filter was applied "
+    "and the row is excluded.",
+)
+
+# A row that failed its filter set but matched none of that set's own failure masks. It
+# should never fire: it means a filter's `reports()` do not cover its `pass_expr`, and
+# without it such a row would come back as a null reason — i.e. as a row that passed.
+UNATTRIBUTED = FilterReport(
+    "unattributed", pl.lit(True), "v_call",
+    "Row failed ingest filtering but matched none of its filters' failure masks — a filter "
+    "whose reports do not cover its own pass condition.",
+)
+
+
+def _first_reason(reasons: List[FilterReport]) -> pl.Expr:
+    """The name of the first reason (in order) whose mask is True on the row; null if none is."""
+    if not reasons:
+        return pl.lit(None, dtype=pl.Utf8)
+    return pl.coalesce([
+        pl.when(r.mask.fill_null(False)).then(pl.lit(r.name)) for r in reasons
+    ])
+
+
+def reason_index() -> dict[str, FilterReport]:
+    """Every reason name this library can produce -> its report (description, group column).
+
+    Built from the registries, not from a dataset's ingest provenance: the reason is stored on
+    the row now, so a consumer only has to look up the names it actually finds. Insertion order
+    is assignment reasons, then quality reasons, then the two catch-alls — a stable display
+    order for anything that wants one.
+    """
+    index: dict[str, FilterReport] = {}
+    for report in ASSIGNMENT_REASONS:
+        index.setdefault(report.name, report)
+    for cls in FILTER_REGISTRY.values():
+        for report in cls().reports():
+            index.setdefault(report.name, report)
+    for report in (LOCUS_NOT_ACCEPTED, UNATTRIBUTED):
+        index.setdefault(report.name, report)
+    return index
+
+
+# ---------------------------------------------------------------------------
 # FilterSet + named-preset registry (Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -176,7 +248,7 @@ def register_filter_set(name: str):
 
 
 class FilterSet:
-    """An ordered collection of `BaseFilter`s. `pass_expr()` combines them into `filter_pass`."""
+    """An ordered collection of `BaseFilter`s. `reason_expr()` combines them into `filter_reason`."""
 
     def __init__(self, filters: List[BaseFilter]):
         self.filters = list(filters)
@@ -184,23 +256,35 @@ class FilterSet:
 
     # --- expressions -------------------------------------------------------
     def pass_expr(self) -> pl.Expr:
-        """Combined pass/fail: each filter null->pass, AND across all. == legacy filter_pass."""
-        return pl.all_horizontal(
-            [f.pass_expr().fill_null(True) for f in self.filters]
-        ).alias("filter_pass")
+        """Combined pass/fail, unaliased: each filter null->pass, AND across all."""
+        return pl.all_horizontal([f.pass_expr().fill_null(True) for f in self.filters])
 
     def reasons(self) -> List[FilterReport]:
         """Ordered, flattened filter -> sub-report list. Drives first-failure attribution."""
         return [r for f in self.filters for r in f.reports()]
 
+    def reason_expr(self) -> pl.Expr:
+        """`filter_reason`: null when the row passes, else the FIRST filter that rejected it.
+
+        The invariant `passes <=> filter_reason.is_null()` is built here rather than hoped for.
+        `pass_expr` stays authoritative for *whether* a row passed; the reason list only says
+        *which* filter is to blame, and it is a projection that a filter may refine into
+        sub-reports. A row failing `pass_expr` that matches none of them gets `unattributed`,
+        because the alternative — a null — would silently promote it to a passing row.
+        """
+        return (pl.when(self.pass_expr())
+                  .then(pl.lit(None, dtype=pl.Utf8))
+                  .otherwise(_first_reason(self.reasons()).fill_null(pl.lit(UNATTRIBUTED.name)))
+                  .alias("filter_reason"))
+
     # --- execution ---------------------------------------------------------
     def run(self, df, *, return_individual: bool = False, drop_failed: bool = False):
-        cols = [self.pass_expr()]
+        cols = [self.reason_expr()]
         if return_individual:
             cols += [f.filter_expr() for f in self.filters]
         df = df.with_columns(cols)
         if drop_failed:
-            df = df.filter(pl.col("filter_pass"))
+            df = df.filter(pl.col("filter_reason").is_null())
         return df
 
     # --- serialisation / provenance ---------------------------------------
@@ -209,16 +293,12 @@ class FilterSet:
         return [f.name for f in self.filters]
 
     @classmethod
-    def from_names(cls, names: List[str]) -> "FilterSet":
-        return cls([FILTER_REGISTRY[n]() for n in names])
-
-    @classmethod
     def named(cls, name: str) -> "FilterSet":
         try:
             builder = FILTER_SET_REGISTRY[name]
         except KeyError:
             raise KeyError(
-                f"unknown filter set {name!r}; available: {sorted(FILTER_SET_REGISTRY)}"
+                f"unknown filter set {name!r}; available: {cls.available()}"
             )
         fset = builder()
         fset._preset_name = name
@@ -231,17 +311,17 @@ class FilterSet:
 
 class PerLocusFilterSet:
     """An explicit map of **chains -> FilterSet**. A locus is accepted ONLY if it is listed; rows of
-    any other locus (and the `_unassigned` partition) get ``filter_pass = False``.
+    any other locus (and the `_unassigned` partition) are excluded, each with a reason of its own.
 
     Construct from a dict with tuple/str keys, or an iterable of ``(chains, FilterSet)`` pairs
     (chains may be a single locus string or an iterable of them)::
 
         PerLocusFilterSet({("TRA", "TRB"): FilterSet.named("default_trb"),
-                           ("IGH",):       FilterSet.named("default_igh")})
+                           ("IGH",):       FilterSet.named("no_junction_nt_trb")})
         PerLocusFilterSet([(["TRA", "TRB"], tcr), (["IGH"], bcr)])   # list keys via pairs
 
     Use :meth:`uniform` for the common "one set for every locus" case.
-    `filter_pass_expr()` needs a `locus` column; `run()` assigns it first if absent.
+    `filter_reason_expr()` needs a `locus` column; `run()` assigns it first if absent.
     """
 
     def __init__(self, mapping):
@@ -271,22 +351,31 @@ class PerLocusFilterSet:
         """The FilterSet for `locus`, or None if that chain is not accepted."""
         return self.by_locus.get(locus)
 
-    def filter_pass_expr(self) -> pl.Expr:
-        # accepted loci -> their set's pass/fail; everything else (unlisted chains + _unassigned) -> False
+    def filter_reason_expr(self) -> pl.Expr:
+        """`filter_reason` over a frame holding several loci — three populations, one column.
+
+        An accepted locus gets its own set's reason (null if the row passed). The
+        `_unassigned` partition gets the assignment-stage reason it could not be placed for,
+        which is the whole point of keeping those rows: "excluded" and "excluded because V and
+        J name different loci" are not the same fact. A locus nobody supplied a filter set for
+        is excluded wholesale, and says so rather than borrowing a quality reason it was never
+        tested against.
+        """
         expr = None
         for loci, fset in self.groups:
             cond = pl.col("locus").is_in(list(loci))
-            expr = (pl.when(cond) if expr is None else expr.when(cond)).then(fset.pass_expr())
-        if expr is None:
-            return pl.lit(False).alias("filter_pass")
-        return expr.otherwise(pl.lit(False)).alias("filter_pass")
+            expr = (pl.when(cond) if expr is None else expr.when(cond)).then(fset.reason_expr())
+        unassigned = _first_reason(ASSIGNMENT_REASONS).fill_null(pl.lit(UNATTRIBUTED.name))
+        cond = pl.col("locus") == UNASSIGNED
+        expr = (pl.when(cond) if expr is None else expr.when(cond)).then(unassigned)
+        return expr.otherwise(pl.lit(LOCUS_NOT_ACCEPTED.name)).alias("filter_reason")
 
     def run(self, df, *, drop_failed: bool = False):
         cols = df.collect_schema().names() if isinstance(df, pl.LazyFrame) else df.columns
         if "locus" not in cols:
             df = df.with_columns(assign_locus())
-        df = df.with_columns(self.filter_pass_expr())
-        return df.filter(pl.col("filter_pass")) if drop_failed else df
+        df = df.with_columns(self.filter_reason_expr())
+        return df.filter(pl.col("filter_reason").is_null()) if drop_failed else df
 
     def provenance(self) -> dict:
         def encode(fset: FilterSet) -> dict:
@@ -294,7 +383,12 @@ class PerLocusFilterSet:
         return {locus: encode(fset) for locus, fset in self.by_locus.items()}
 
 
-# --- named presets (fill in as needed) -------------------------------------
+# --- named presets ---------------------------------------------------------
+# The registry IS the extension mechanism: a dataset that needs different cleaning gets a
+# preset added here, not a FilterSet assembled at the call site. That is what makes the
+# ingest record reproducible — `preset: "no_junction_nt_trb"` re-runs, a list of filter
+# names only describes. A preset with no in-repo caller is the normal case; its callers
+# are ingestion scripts.
 
 @register_filter_set("default_trb")
 def _default_trb() -> FilterSet:

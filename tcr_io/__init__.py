@@ -1,6 +1,6 @@
 from tcr_io._internal import __version__ as __version__
 
-from .dataset import TcrDataset
+from .dataset import Dataset
 from .ingestion import DatasetIngester
 from .readers import ReaderFactory, BaseReader
 from .mappers import (
@@ -16,7 +16,7 @@ from . import operations
 
 __all__ = [
     "__version__",
-    "TcrDataset",
+    "Dataset",
     "DatasetIngester",
     "ReaderFactory",
     "BaseReader",

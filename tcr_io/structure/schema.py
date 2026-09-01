@@ -1,13 +1,11 @@
 import polars as pl
 
-GENERATION_META = pl.Schema({
-    "dataset_name": pl.Utf8,
-    "created_on": pl.Date,
-    "source": pl.Utf8,
-    "reader" : pl.Utf8,
-    "repertoire_mapper": pl.Utf8,
-    "patient_mapper": pl.Utf8,
-}) # ndjson
+# The ingest record (`meta/generation.json`) is a JSON object, not a table: one dataset, one
+# row, and a nested `filters` value that a polars schema can only express as a struct column.
+# It answers "how was this dataset made" — source, mappers, reader, library version and the
+# filter set applied per locus — and it is the only record of the cleaning that ingestion does
+# in place. Written by `DatasetIngester`, read by `ds.generation_meta`. No schema here: it is a
+# self-describing dict, like `OperationRecord`.
 
 REPERTOIRE = pl.Schema({
     "clonotype_id": pl.UInt32,   # per-(repertoire, locus) row number (assigned at ingest)
@@ -17,7 +15,12 @@ REPERTOIRE = pl.Schema({
     "junction_aa": pl.Utf8,
     "j_call": pl.Utf8,
     "duplicate_count": pl.Int64,
-    "filter_pass": pl.Boolean,
+    # Null when the row passed ingest filtering, otherwise the name of the FIRST filter that
+    # rejected it. The invariant is `passed <=> filter_reason.is_null()`, so this replaces the
+    # old boolean rather than sitting beside it — and the reason a row was dropped stops being
+    # unrecoverable, which is what let the filtering report become a group-by instead of a
+    # rebuild-from-provenance.
+    "filter_reason": pl.Utf8,
 }) # parquet
 
 # Single-cell only: the clonotype<->cell mapping, long form (one row per cell membership).
@@ -30,13 +33,20 @@ CLONE_TO_CELL = pl.Schema({
     "cell_id": pl.Utf8,
 }) # parquet
 
+# One row per repertoire, locus-invariant. Owned by the dataset, not by a locus.
 REPERTOIRE_META = pl.Schema({
     "repertoire_id": pl.Utf8,
     "source_files" : pl.List(pl.Utf8),
     "patient_id": pl.Utf8,
-    "n_clonotypes": pl.Int64,
-    "n_filtered_clonotypes":pl.Int64,
-    "total_duplicates": pl.Int64
+}) # parquet
+
+# One row per repertoire *within one locus*, stored under that locus's partition. A repertoire
+# appears only in the loci it actually produced.
+REPERTOIRE_COUNTS = pl.Schema({
+    "repertoire_id": pl.Utf8,
+    "n_clonotypes": pl.Int64,           # rows that passed filtering
+    "n_filtered_clonotypes": pl.Int64,  # rows that were rejected
+    "total_duplicates": pl.Int64,
 }) # parquet
 
 PATIENT_META = pl.Schema({
@@ -48,6 +58,23 @@ PATIENT_META = pl.Schema({
 PUBLICATION_META = pl.Schema({
     "publication_id": pl.Utf8,
 }) # ndjson
+
+# Publication metadata fetched from the web by `MetadataWriter.fetch_publications`, one row per
+# publication_id, joined into `full_publication_meta`. Written into the free-form publication
+# side table, so these are the column names the writer owns: a refetch replaces them and leaves
+# the user's own columns alone. `error` set means the fetch failed and the rest is null.
+PUBLICATION_FETCHED = pl.Schema({
+    "publication_id": pl.Utf8,
+    "title": pl.Utf8,
+    "abstract": pl.Utf8,
+    "authors": pl.List(pl.Utf8),
+    "year": pl.Int64,
+    "source_type": pl.Utf8,      # doi / pmc / bioproject / adaptive / unknown
+    "doi": pl.Utf8,
+    "pmid": pl.Utf8,
+    "journal": pl.Utf8,
+    "error": pl.Utf8,
+}) # parquet
 
 # Ground-truth ("known") HLA typing, one row per patient. Each locus column holds the
 # patient's alleles as bare 4-digit strings (e.g. ["0201", "2902"]); an untyped locus is a

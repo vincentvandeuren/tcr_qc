@@ -1,6 +1,5 @@
-import math
-
-from tcr_io.operations.base import BaseOperation, OperationResults
+from tcr_io.operations.base import BaseOperation
+from tcr_io.structure import Artifact, Format, Store
 from tcr_io._resources import resource_path
 from tcr_io.expressions import extract_genes
 import polars as pl
@@ -16,6 +15,11 @@ class BaseHits(BaseOperation, ABC):
     description = "Counts the number of hits for each repertoire."
     result_name_short = "base"
     supported_loci = frozenset({"TRB"})
+
+    # NO `hits` artifact here. `BaseOperation.artifacts()` refuses an inherited output, because
+    # an output's directory comes from `owner.name` — one declared here would file every
+    # subclass's table under `base_hits/`. Each concrete subclass declares its own `hits`; the
+    # computation below writes through `self.hits` and so picks up whichever one that is.
 
     model_checkpoint: Optional[str] = None
 
@@ -36,7 +40,7 @@ class BaseHits(BaseOperation, ABC):
     def _prepare_query_df(self, model_checkpoint:Path) -> pl.LazyFrame:
         pass
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
+    def _run(self, ds, out: Store) -> None:
         """
         Clonal breadth and depth of disease-specific T-cell response.
         As defined in Snyder et al https://doi.org/10.3389/fimmu.2024.1488860
@@ -144,25 +148,22 @@ class BaseHits(BaseOperation, ABC):
             )
 
         ms = ds.map_repertoires(
-            hit_metrics, locus=locus, progress_bar=True,
+            hit_metrics, progress_bar=True,
             progress_desc=f"Counting {name} hits in repertoires",
         )   # eager: per-rep collect inside the helper
 
-        hits_df = ds.repertoire_meta(locus).select(["repertoire_id"]).join(
-            ms,
-            on="repertoire_id",
-            how="left",
+        out(self.hits).write(
+            ds.repertoire_counts.select(["repertoire_id"]).join(ms, on="repertoire_id", how="left")
         )
-        return OperationResults(outputs={
-            f"{self.result_name_short}_hits": hits_df,
-        })
 
 @dataclass
 class MaitHits(BaseHits):
     name = "mait_hits"
     version = "0.6"
     description = "Counts the number of mait hits (from unconventional tcr db) for each repertoire."
-    result_name_short = "mait"
+    result_name_short = "mait"     # column prefix; the artifact below names the file
+
+    hits = Artifact("mait_hits.parquet", Format.PARQUET)
 
     def _default_checkpoint(self) -> Optional[str | Path]:
         # The MAIT reference set is bundled; default to it, allow a path override.

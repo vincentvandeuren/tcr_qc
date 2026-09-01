@@ -1,9 +1,10 @@
 import polars as pl
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional
 from scipy.special import binom
-from .base import ALL_LOCI, BaseOperation, OperationResults
+from .base import BaseOperation
+from ..expressions import KNOWN_LOCI
+from ..structure import Artifact, Format, Store
 
 def compute_metrics(lf: pl.LazyFrame) -> pl.DataFrame:
     """
@@ -110,14 +111,12 @@ class DiversityReport(BaseOperation):
     name = "diversity_report"
     version = "0.1"
     description = "Generates a report summarizing diversity metrics across repertoires."
-    supported_loci = ALL_LOCI
+    supported_loci = KNOWN_LOCI
 
+    diversity_summary = Artifact("diversity_summary.parquet", Format.PARQUET)
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        diversity_summ = ds.map_repertoires(
-            compute_metrics, locus=locus, filter_pass_only=True,
+    def _run(self, ds, out: Store) -> None:
+        out(self.diversity_summary).write(ds.map_repertoires(
+            compute_metrics, passing_only=True,
             progress_bar=True, progress_desc="Computing diversity metrics",
-        )
-        return OperationResults(outputs={
-            "diversity_summary": diversity_summ,
-        })
+        ))
