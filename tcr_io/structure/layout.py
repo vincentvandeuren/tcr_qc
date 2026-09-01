@@ -1,210 +1,93 @@
-"""
-Single source of truth for the dataset folder structure.
+"""Every well-known path in a dataset, declared once.
 
-Every well-known path in a dataset is declared once here as an `Artifact` on the
-`Layout` class. Read/write sites resolve paths through `Layout.<key>.path` (or
-`LAYOUT["<key>"]`) instead of hardcoding literals, so the structure can no longer
-drift between `dataset.py`, `ingestion.py`, and the operations.
+An artifact is a *template* plus everything needed to read and write it: its format
+(extension + codec), its schema, and what absence means. Nothing else in the library
+constructs a dataset path — call sites resolve through a `Store`:
 
-Per-repertoire files can't be enumerated (one dir per repertoire, hive-partitioned by locus),
-so they get path *builders* (`repertoire_dir_relpath` / `repertoire_locus_relpath`) rather than
-static `Artifact`s. Those builders are the single place the `{id}/locus={LOCUS}/` layout is
-constructed — see docs/per_repertoire_hive_layout_plan.md.
+    store = Store(db_dir)
+    store(PATIENT_META).read()
+    store(REPERTOIRE_FILE, repertoire_id="s1", locus="TRB").path()
+    store(REPERTOIRE_FILE, locus="TRB").glob()        # repertoire_id unbound -> every match
 
-Operation outputs all live under a single generated root (`Layout.operations_dir.path`);
-the framework roots + suffixes them via `operation_relpath`, so they are not declared here.
+The tree is locus-first: `locus={L}/` is one level under `processed_repertoires/`, so the
+hot path — every file of one locus — is a single listing, `rm -r
+processed_repertoires/locus=TRB/` means something, and the set of loci a dataset holds is a
+listing rather than a value copied into the manifest.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
+
 import polars as pl
 
-from . import schema
+from . import schema as s
+from .store import Artifact, Format as F, OnMissing as M
 
+# --- repertoires ------------------------------------------------------------------------
+# `locus` lives only in the path (`include_key=False`), recovered on read via hive
+# partitioning. The leaves are written by one `pl.PartitionBy` sink at ingest, so they are
+# not individually writable.
 
-class Kind(Enum):
-    DIR = "dir"
-    PARQUET = "parquet"
-    NDJSON = "ndjson"
-    JSON = "json"       # single pretty-printed object (e.g. the version manifest)
-    UNSTRUCTURED = "unstructured"   # op-written directory of arbitrary result files
+PROCESSED_DIR   = Artifact("processed_repertoires", F.PARQUET_DIR, writable=False)
+LOCUS_DIR       = Artifact("processed_repertoires/locus={locus}", F.PARQUET_DIR, writable=False)
+REPERTOIRE_FILE = Artifact("processed_repertoires/locus={locus}/{repertoire_id}.parquet",
+                           F.PARQUET, s.REPERTOIRE, writable=False)
 
+# --- metadata written at ingestion ------------------------------------------------------
+# Repertoire metadata is split by grain: what is true of a repertoire whatever the locus
+# (`REPERTOIRE_META`) and what is only true within one (`REPERTOIRE_COUNTS`). One table
+# carrying both duplicated the locus-invariant half into every locus file, and every
+# consumer of that half paid to read the other and then dedupe it away.
 
-class Role(Enum):
-    REQUIRED = "required"      # validated on load, created at ingestion
-    OPTIONAL = "optional"      # joined in if present
-    GENERATED = "generated"    # created at ingestion, rebuildable/deletable, not validated
+REPERTOIRE_META   = Artifact("meta/repertoire/repertoire.parquet", F.PARQUET, s.REPERTOIRE_META)
+REPERTOIRE_COUNTS = Artifact("meta/repertoire/locus={locus}/counts.parquet",
+                             F.PARQUET, s.REPERTOIRE_COUNTS)
+PATIENT_META      = Artifact("meta/patient/patient.parquet",    F.PARQUET, s.PATIENT_META)
+PUBLICATION_IDS   = Artifact("meta/publication/publication_ids.ndjson", F.NDJSON, s.PUBLICATION_META)
+GENERATION_META   = Artifact("meta/generation.json",           F.JSON)
+MANIFEST          = Artifact("meta/manifest.json",              F.JSON,   on_missing=M.NONE)
 
+# --- optional side tables, joined in when present ---------------------------------------
+# `requires` is the join key: these carry user columns under no fixed schema, so the only
+# thing worth asserting is that the key is there and is the right type. Named `extra.parquet`
+# under the grain they extend, so `meta/repertoire/` reads as one directory about
+# repertoires rather than as two files whose names differ by a suffix.
 
-@dataclass(frozen=True)
-class Artifact:
-    path: str
-    kind: Kind
-    role: Role = Role.REQUIRED
-    schema: Optional[pl.Schema] = None
-    description: str = ""
-    key: str = field(default="", compare=False)   # filled in by __set_name__
+REPERTOIRE_EXTRA  = Artifact("meta/repertoire/extra.parquet", F.PARQUET,
+                             on_missing=M.NONE, requires=pl.Schema({"repertoire_id": pl.Utf8}))
+PATIENT_EXTRA     = Artifact("meta/patient/extra.parquet", F.PARQUET,
+                             on_missing=M.NONE, requires=pl.Schema({"patient_id": pl.Utf8}))
+PUBLICATION_EXTRA = Artifact("meta/publication/publication.parquet", F.PARQUET,
+                             on_missing=M.NONE, requires=pl.Schema({"publication_id": pl.Utf8}))
+HLA               = Artifact("meta/patient/hla.parquet", F.PARQUET, s.HLA_META, on_missing=M.NONE)
 
-    def __set_name__(self, owner, name):
-        object.__setattr__(self, "key", name)      # frozen dataclass -> bypass __setattr__
-        # Only auto-register on classes that opt in (i.e. Layout). This lets Artifacts be
-        # declared as class attributes on operations, or built at runtime, without polluting
-        # the global LAYOUT registry.
-        if hasattr(owner, "_registry"):
-            owner._registry[name] = self
+# --- single-cell clonotype<->cell map (single-cell datasets only) ------------------------
+# EMPTY, not NONE: a bulk repertoire has no map, and an empty typed frame joins correctly
+# where a `None` would need a branch at every call site.
 
+CLONE_TO_CELL_DIR = Artifact("meta/clone_to_cell", F.PARQUET_DIR, writable=False,
+                             on_missing=M.NONE)
+CLONE_TO_CELL     = Artifact("meta/clone_to_cell/{repertoire_id}.parquet",
+                             F.PARQUET, s.CLONE_TO_CELL, on_missing=M.EMPTY)
 
-class Layout:
-    """Declarative dataset structure. Access as `Layout.patient_meta.path`."""
-    _registry: dict[str, Artifact] = {}
+ARTIFACTS = (
+    PROCESSED_DIR, LOCUS_DIR, REPERTOIRE_FILE,
+    REPERTOIRE_META, REPERTOIRE_COUNTS, PATIENT_META, PUBLICATION_IDS, GENERATION_META,
+    MANIFEST,
+    REPERTOIRE_EXTRA, PATIENT_EXTRA, PUBLICATION_EXTRA, HLA,
+    CLONE_TO_CELL_DIR, CLONE_TO_CELL,
+)
 
-    # --- directories (the skeleton) ---
-    processed_dir       = Artifact("processed_repertoires", Kind.DIR, description="one parquet per repertoire (atomic unit)")
-    meta_dir            = Artifact("meta", Kind.DIR)
-    repertoire_meta_dir = Artifact("meta/repertoire", Kind.DIR)
-    patient_meta_dir    = Artifact("meta/patient", Kind.DIR)
-    publication_dir     = Artifact("meta/publication", Kind.DIR)
-    operations_dir      = Artifact("operations", Kind.DIR, role=Role.GENERATED, description="all generated operation results")
+assert len({a.template for a in ARTIFACTS}) == len(ARTIFACTS), "duplicate artifact template"
 
-    # --- version manifest (absent on pre-versioning datasets -> optional) ---
-    manifest = Artifact("meta/manifest.json", Kind.JSON, role=Role.OPTIONAL, description="dataset version")
+# Every artifact's name matches its format. This used to carry an exemption for two NDJSON
+# files named `.json`; the v6 rename removed them, and the exemption died with them.
+assert not [a.template for a in ARTIFACTS
+            if not a.format.is_dir and not a.template.endswith(a.format.ext)]
 
-    # --- core files (written at ingestion; carry schemas) ---
-    generation_meta = Artifact("meta/generation.json", Kind.NDJSON, schema=schema.GENERATION_META, description="how/when/source this dataset was built")
-    # repertoire_meta is written one parquet per locus (meta/repertoire/{LOCUS}.parquet) — a
-    # parameterised leaf, so it lives in the `repertoire_meta_relpath` builder, not a static
-    # Artifact. Its schema is `schema.REPERTOIRE_META` (the same for every locus).
-    patient_meta    = Artifact("meta/patient/patient.parquet", Kind.PARQUET, schema=schema.PATIENT_META, description="one row per patient")
-    publication_ids = Artifact("meta/publication/publication_ids.json", Kind.NDJSON, schema=schema.PUBLICATION_META, description="DOIs / pubmed ids")
-
-    # --- single-cell clonotype<->cell map (present only for single-cell datasets) ---
-    clone_to_cell_dir = Artifact("meta/clone_to_cell", Kind.DIR, role=Role.OPTIONAL, description="single-cell clonotype↔cell map (one parquet per repertoire)")
-
-    # --- optional side files (joined in if present) ---
-    repertoire_meta_extra = Artifact("meta/repertoire/repertoire_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-repertoire metadata, joined on repertoire_id")
-    patient_meta_extra    = Artifact("meta/patient/patient_meta.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="extra per-patient metadata, joined on patient_id")
-    hla                   = Artifact("meta/patient/hla.parquet", Kind.PARQUET, role=Role.OPTIONAL, schema=schema.HLA_META, description="known HLA typing")
-    publication_meta      = Artifact("meta/publication/publication.parquet", Kind.PARQUET, role=Role.OPTIONAL, description="fetched publication metadata cache")
-
-
-LAYOUT: dict[str, Artifact] = Layout._registry
-
-REQUIRED_DIRS  = [a.path for a in LAYOUT.values() if a.kind is Kind.DIR and a.role is Role.REQUIRED]
-GENERATED_DIRS = [a.path for a in LAYOUT.values() if a.kind is Kind.DIR and a.role is Role.GENERATED]
+# Operation outputs live under one generated root, rooted and named by the runner rather
+# than declared here: their paths are `(operation, locus, output name)`, not fixed strings.
+OPERATIONS_DIR = "operations"
 
 
 def safe_repertoire_name(repertoire_id: str) -> str:
-    """Filesystem-safe repertoire filename stem (also the repertoire's directory name)."""
+    """Filesystem-safe repertoire filename stem."""
     return repertoire_id.replace("/", "_")
-
-
-def repertoire_dir_relpath(repertoire_id: str) -> str:
-    """A repertoire's directory — the `pl.PartitionBy` base:
-    ``processed_repertoires/{repertoire_id}/``. Locus partitions (``locus={LOCUS}/``) live under it.
-    """
-    return f"{Layout.processed_dir.path}/{safe_repertoire_name(repertoire_id)}"
-
-
-def repertoire_locus_relpath(repertoire_id: str, locus: str) -> str:
-    """A repertoire's parquet for one locus (hive-partitioned):
-    ``processed_repertoires/{repertoire_id}/locus={LOCUS}/{repertoire_id}.parquet``.
-
-    Single place the leaf layout is constructed — the ingest `file_path_provider`, per-locus reads,
-    and the migration all resolve through here so they cannot drift. `locus` is encoded only in the
-    path (``include_key=False``), recovered on read via ``hive_partitioning=True``.
-    """
-    safe = safe_repertoire_name(repertoire_id)
-    return f"{Layout.processed_dir.path}/{safe}/locus={locus}/{safe}.parquet"
-
-
-def clone_to_cell_relpath(repertoire_id: str) -> str:
-    """A repertoire's single-cell clonotype↔cell map: ``meta/clone_to_cell/{repertoire_id}.parquet``.
-    Written only for single-cell repertoires (the dir is `Role.OPTIONAL`, created lazily on first write).
-    """
-    return f"{Layout.clone_to_cell_dir.path}/{safe_repertoire_name(repertoire_id)}.parquet"
-
-
-def loci_glob(locus: str = "*") -> str:
-    """Glob for a locus across **all** repertoires: ``processed_repertoires/*/locus={LOCUS}/*.parquet``
-    (``locus='*'`` matches every partition). Used by the op fan-out (`iter_repertoires(locus=L)`)."""
-    return f"{Layout.processed_dir.path}/*/locus={locus}/*.parquet"
-
-
-def repertoire_meta_relpath(locus: str) -> str:
-    """Relative path of a locus's repertoire-meta parquet: ``meta/repertoire/{LOCUS}.parquet``.
-
-    Option C: one meta table per locus, each carrying the `schema.REPERTOIRE_META` schema
-    (grain unchanged — one row per repertoire_id within a locus).
-    """
-    return f"{Layout.repertoire_meta_dir.path}/{locus}.parquet"
-
-
-def operation_relpath(op_name: str, output: str, locus: Optional[str] = None) -> str:
-    """Relative path of one operation output within a dataset.
-
-    Mirrors `repertoire_locus_relpath`; the **only** place a locus segment is added to an
-    operation output. Ops name their outputs (e.g. ``"gene_counts"``); the framework roots
-    them under ``operations/<op>/`` and (for locus-aware ops) inserts a ``<LOCUS>/`` segment.
-    The file extension is chosen from the output's `Kind` at write time, not here.
-    """
-    parts = [Layout.operations_dir.path, op_name] + ([locus] if locus else []) + [output]
-    return "/".join(parts)
-
-
-def _annotate(art: Optional[Artifact]) -> str:
-    if art is None:
-        return ""
-    tags = []
-    if art.role is not Role.REQUIRED:
-        tags.append(art.role.value)
-    if art.description:
-        tags.append(art.description)
-    return "  # " + " — ".join(tags) if tags else ""
-
-
-def render_tree(root_name: str = "dataset", examples: bool = True) -> str:
-    """Render the layout registry as an ASCII directory tree.
-
-    The tree is *derived* from `LAYOUT`, so it can never drift from the real structure
-    (that's the point). `examples=True` also shows the parameterised per-repertoire file,
-    which lives in a path builder rather than a static Artifact.
-    """
-    # nested trie: part -> {"art": Artifact|None, "children": {...}}
-    tree: dict = {}
-    entries = [(a.path, a) for a in LAYOUT.values()]
-    if examples:
-        entries.append((repertoire_locus_relpath("sample_001", "TRB"), None))  # illustrative leaf
-        entries.append((repertoire_meta_relpath("TRB"), None))                 # per-locus meta leaf
-
-    for path, art in entries:
-        node = tree
-        parts = path.split("/")
-        for i, part in enumerate(parts):
-            entry = node.setdefault(part, {"art": None, "children": {}})
-            if i == len(parts) - 1 and art is not None:
-                entry["art"] = art
-            node = entry["children"]
-
-    def is_dir(entry) -> bool:
-        return bool(entry["children"]) or (entry["art"] is not None and entry["art"].kind is Kind.DIR)
-
-    lines = [f"{root_name}/"]
-
-    def walk(node: dict, prefix: str) -> None:
-        # directories first, then alphabetically
-        items = sorted(node.items(), key=lambda kv: (not is_dir(kv[1]), kv[0]))
-        for i, (name, entry) in enumerate(items):
-            last = i == len(items) - 1
-            connector = "└── " if last else "├── "
-            label = name + ("/" if is_dir(entry) else "")
-            lines.append(f"{prefix}{connector}{label}{_annotate(entry['art'])}")
-            if entry["children"]:
-                walk(entry["children"], prefix + ("    " if last else "│   "))
-
-    walk(tree, "")
-    return "\n".join(lines)
-
-
-if __name__ == "__main__":   # python -m tcr_io.structure.layout
-    print(render_tree())

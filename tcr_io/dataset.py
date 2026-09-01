@@ -1,114 +1,95 @@
 from __future__ import annotations
 from functools import cached_property
-from dataclasses import asdict
 import json
 import logging
-import shutil
 import warnings
-from time import time
-from datetime import datetime
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 import polars as pl
 from pathlib import Path
 from tqdm import tqdm
-from packaging.version import parse as parse_version
 
-from .operations.base import (
-    OperationFailure, OperationResults, OperationRecord, OutputRecord,
-)
-from .operations import BaseOperation
+from .operations.base import BaseOperation
+from .operations.record import OPERATION_RECORD, OperationRecord
+from .operations.runner import OperationRunner
 from .grouper import Grouper
+# `layout` whole, the machinery by name. This module reads most of the layout — one accessor
+# per artifact — so listing each would mean editing this block to add an accessor, and
+# `layout.X` says at the call site that X is a declared path rather than a local.
 from .structure import (
-    Layout, REQUIRED_DIRS, repertoire_dir_relpath, repertoire_locus_relpath, loci_glob,
-    repertoire_meta_relpath, clone_to_cell_relpath, operation_relpath,
-    write_artifact, Artifact, Kind, Role, Manifest, DATASET_VERSION, CLONE_TO_CELL,
+    layout, Artifact, Handle, Store, Manifest, Migrator, DATASET_VERSION, required_dirs,
 )
-from .structure import schema as _schema
-from .structure import meta_edit
+from .metadata import MetadataWriter
 from .expressions import UNASSIGNED
 
 log = logging.getLogger(__name__)
 
 
-# Extension chosen from an output's Kind at write time (the op names outputs; the framework
-# roots + suffixes them). Unstructured outputs are op-written directories -> no extension and
-# no framework writer, so they never pass through here.
-_KIND_EXT = {
-    Kind.PARQUET: ".parquet",
-    Kind.NDJSON: ".ndjson",
-    Kind.JSON: ".json",
-}
+class LocusRequiredError(ValueError):
+    """A locus-grain method called on a dataset with no locus bound.
 
-
-def _output_kind(result) -> Kind:
-    if isinstance(result, list):
-        return Kind.NDJSON
-    if isinstance(result, (pl.DataFrame, pl.LazyFrame)):
-        return Kind.PARQUET
-    raise TypeError(f"Unsupported operation output type: {type(result)!r}")
-
-
-def _fmt_ids(ids: List[str], cap: int = 10) -> str:
-    """Render a (possibly long) id list for a warning/error message, capped with an ellipsis."""
-    shown = [str(i) for i in ids[:cap]]
-    if len(ids) > cap:
-        shown.append(f"... (+{len(ids) - cap} more)")
-    return "[" + ", ".join(shown) + "]"
-
-
-def _read_output(path: Path, kind: str):
-    if kind == Kind.PARQUET.value:
-        return pl.read_parquet(path)
-    if kind == Kind.NDJSON.value:
-        return pl.read_ndjson(path)
-    if kind == Kind.JSON.value:
-        return json.loads(Path(path).read_text())
-    raise ValueError(f"Cannot read operation output of kind {kind!r} at {path}")
-
-
-class TcrDataset:
-    """
-    Handle to a TCR dataset directory. Knows structure; provides accessors.
-
-    Mostly read-through (every accessor reads from disk on demand), but it also owns the few
-    supported mutations: ``migrate`` (version upgrade), ``run_operation`` (generated results),
-    and the ``set_patient_meta`` / ``set_repertoire_meta`` / ``set_hla`` side-metadata writers.
+    The price of one class instead of two. A `LocusDataset` would make "wrong grain" a
+    method that does not exist; one class makes it a named exception, raised in the one line
+    `_locus` shares among the methods that charge it — and spares the ten-odd hand-written
+    forwards a second class needs to look like the first.
     """
 
-    def __init__(self, db_dir:str|Path):
+
+class Dataset:
+    """
+    Handle to a repertoire dataset directory, optionally bound to one locus. Knows structure;
+    provides accessors.
+
+    Named `Dataset`, not `TcrDataset`: the library reads BCR loci as well as TR ones, and the
+    locus set (`expressions.KNOWN_LOCI`) has covered both since the chain work. The old name
+    described one of the two.
+
+    Mostly read-through (every accessor reads from disk on demand). It is also the entry point
+    for the four supported mutations — ``migrate`` (version upgrade), ``run_operation`` and
+    ``rerun`` (generated results), and the ``metadata`` side-table writers — but it *implements*
+    none of them: each constructs its writer (`Migrator`, `OperationRunner`, `MetadataWriter`)
+    and hands off. One owner per mutation is the guarantee; a read-only dataset is not, and is
+    not enforced — `store` is public and a `Handle` writes as well as reads.
+
+    A bound locus is bound in the `Store`, so `{locus}` templates resolve with no call site
+    passing one: `ds.select_locus("TRB").iter_repertoires()`. The locus-grain methods raise
+    `LocusRequiredError` unbound; the rest work either way.
+    """
+
+    def __init__(self, db_dir:str|Path, *, locus: Optional[str] = None):
         self.db_dir = Path(db_dir)
         self.db_name = self.db_dir.name
-        # Unstructured directory outputs an op requested during the current `_run` (reset per
-        # locus in `run_operation`); drained into the op record. See `_operation_output_dir`.
-        self._pending_unstructured: List[OutputRecord] = []
+        # Normally set by `select_locus`; `run_operation` binds one dataset per pass.
+        self.locus = locus
         self._validate_dirs()
         self._check_version()
-        self._refresh_operation_results()
 
     @classmethod
-    def migrated(cls, db_dir:str|Path) -> "TcrDataset":
+    def migrated(cls, db_dir:str|Path) -> "Dataset":
         """Alternative constructor: open a dataset, upgrading it **in place** to the current
-        version first. Unlike ``TcrDataset(path)`` (which only warns when behind), this mutates
-        the dataset on disk via ``.migrate()`` and returns a handle at ``DATASET_VERSION``."""
-        ds = cls.__new__(cls)
-        ds.db_dir = Path(db_dir)
-        ds.db_name = ds.db_dir.name
-        if not ds.db_dir.exists():
-            raise FileNotFoundError(f"Dataset directory does not exist: {ds.db_dir}")
-        ds._pending_unstructured = []
-        ds.migrate()          # brings structure AND version up to current, on a possibly-old tree
-        ds._validate_dirs()   # now the tree matches the current layout
-        ds._check_version()   # equal -> silent
-        ds._refresh_operation_results()
-        return ds
+        version first. Unlike ``Dataset(path)`` (which only warns when behind), this mutates
+        the dataset on disk and returns a handle at ``DATASET_VERSION``.
 
-    def path(self, artifact) -> Path:
-        """Absolute path of a layout Artifact within this dataset."""
-        return self.db_dir / artifact.path
+        The upgrade runs *before* any dataset exists, which is the whole reason `Migrator` is a
+        separate class: on a v0 tree the constructor's own checks would reject the very
+        directory it is about to fix."""
+        Migrator(db_dir).migrate()
+        return cls(db_dir)
+
+    @property
+    def store(self) -> Store:
+        """Every path in this dataset resolves through here. A bound locus is bound here, so
+        `select_locus` *is* `with_params(locus=...)` and no read has to pass one."""
+        store = Store(self.db_dir)
+        return store.with_params(locus=self.locus) if self.locus else store
+
+    def path(self, artifact, **params) -> Path:
+        """Absolute path of an Artifact within this dataset. Template parameters
+        (``locus``, ``repertoire_id``) are passed as keywords."""
+        return self.store(artifact, **params).path()
 
     @cached_property
     def _manifest(self) -> Manifest:
-        return Manifest.read(self.db_dir / Layout.manifest.path)
+        return Manifest.read(self.store)
 
     @property
     def version(self) -> int:
@@ -118,7 +99,10 @@ class TcrDataset:
         if not self.db_dir.exists():
             raise FileNotFoundError(f"Dataset directory does not exist: {self.db_dir}")
 
-        missing = [d for d in REQUIRED_DIRS if not (self.db_dir / d).exists()]
+        # Same derivation ingestion builds the tree from, so the two cannot disagree about
+        # which directories a dataset must have.
+        missing = [str(d.relative_to(self.db_dir))
+                   for d in required_dirs(self.db_dir, layout.ARTIFACTS) if not d.is_dir()]
         if missing:
             raise FileNotFoundError(f"Missing required subdirectories: {', '.join(missing)}")
 
@@ -130,7 +114,7 @@ class TcrDataset:
             case -1:
                 warnings.warn(
                     f"Dataset is v{disk}, library expects v{lib}. "
-                    f"Open with TcrDataset.migrated(path) to upgrade it in place.",
+                    f"Open with Dataset.migrated(path) to upgrade it in place.",
                     stacklevel=2,
                 )
             case 1:
@@ -139,455 +123,266 @@ class TcrDataset:
                 )
 
     def migrate(self, target: int = DATASET_VERSION, *, dry_run: bool = False) -> list:
-        """Apply registered migrations to bring the dataset up to ``target``. Commits the
-        manifest after each step so a mid-chain failure leaves a resumable state."""
-        from .structure import migrations   # lazy: avoids dataset<->migrations import cycle
-
-        plan, v = [], self.version
-        while v < target:
-            step = migrations.REGISTRY.get(v + 1)
-            if step is None:
-                raise RuntimeError(f"No migration registered for v{v} -> v{v + 1}")
-            plan.append(step)
-            v = step.to_version
-
-        for step in plan:
-            log.info("migrate v%d -> v%d: %s", step.to_version - 1, step.to_version, step.description)
-            if not dry_run:
-                step.fn(self)
-                self._write_version(step.to_version)   # commit after each step
+        """Upgrade this dataset in place. Delegates; the dataset's only stake is that its
+        cached manifest is now stale."""
+        plan = Migrator(self.db_dir).migrate(target, dry_run=dry_run)
+        self.__dict__.pop("_manifest", None)
         return plan
 
-    def _write_version(self, v: int) -> None:
-        # Preserve present_loci (and any other manifest fields set by ingestion/migration) when a
-        # migration bumps the version — reconstructing a bare Manifest here would wipe them.
-        cur = Manifest.read(self.db_dir / Layout.manifest.path)
-        Manifest(version=v, tcrio_version=Manifest.current().tcrio_version,
-                 present_loci=cur.present_loci).write(self.db_dir / Layout.manifest.path)
-        self.__dict__.pop("_manifest", None)   # invalidate cached_property -> version re-reads
+    # --- locus ---------------------------------------------------------------------------
 
-    def _present_loci(self) -> frozenset:
-        """Loci present in the dataset — recorded in the manifest at ingestion and fixed thereafter
-        (O(1) read, no globbing). Drives the per-locus fan-out in `run_operation`. Excludes the
-        `_unassigned` QC bucket (never recorded as a present locus)."""
-        return frozenset(self._manifest.present_loci)
+    @cached_property
+    def dispatch_loci(self) -> frozenset:
+        """Every locus partition on disk — one listing of `processed_repertoires/locus=*/`.
+
+        This used to be a manifest field copied in at ingestion, which is a derived value
+        persisted: delete a locus's directory and the dataset went on claiming it. The listing
+        cannot disagree with the tree because it *is* the tree, and the locus-first layout is
+        what made it one directory read instead of a glob across every repertoire.
+        """
+        return frozenset(d.name.split("=", 1)[1]
+                         for d in Store(self.db_dir)(layout.LOCUS_DIR).glob())
+
+    @property
+    def present_loci(self) -> frozenset:
+        """The real loci — `dispatch_loci` without the `_unassigned` QC bucket, which is where
+        rows with no derivable locus go, not a locus. Drives the fan-out in `run_operation`."""
+        return self.dispatch_loci - {UNASSIGNED}
+
+    def select_locus(self, locus: str) -> "Dataset":
+        """This dataset bound to one locus. Every locus-grain read then needs no argument."""
+        if locus not in self.dispatch_loci:
+            raise ValueError(
+                f"Locus {locus!r} is not in this dataset; have {sorted(self.dispatch_loci)}."
+            )
+        return Dataset(self.db_dir, locus=locus)
+
+    def each_locus(self) -> Generator["Dataset", None, None]:
+        """One bound dataset per present locus — the answer to "do X for every locus". The
+        concat is one line and belongs to whoever wants the frame, not to this iterator."""
+        for l in sorted(self.present_loci):
+            yield Dataset(self.db_dir, locus=l)
+
+    def _locus(self, method: str) -> str:
+        """The bound locus, or a named error. The one line every locus-grain method shares."""
+        if self.locus is None:
+            raise LocusRequiredError(
+                f"{method}() is locus-grain; call it on ds.select_locus(<LOCUS>). "
+                f"Present loci: {sorted(self.present_loci)}."
+            )
+        return self.locus
+
+    # --- operations -----------------------------------------------------------------
 
     def run_operation(self, operation: BaseOperation, *, force: bool = False):
-        """Run an operation across the loci it supports, writing name-keyed outputs under
-        ``operations/<op>/[<locus>/]`` and a self-describing ``operation.json`` record.
-
-        Per-locus skip: a locus whose successful result is already recorded (at >= this op's
-        version) is skipped unless ``force``; only missing loci re-run."""
-        present = self._present_loci()
-        ran_loci: List[Optional[str]] = []
-        output_records: List[OutputRecord] = []
-        start = time()
-
-        # A version bump can change an op's output set/layout (e.g. locus-agnostic -> per-locus).
-        # Clear the op dir so stale outputs from the old version are not orphaned and the old-layout
-        # record is not merged into the new one. Same-version (incremental per-locus) runs untouched.
-        prior = self._read_operation_record(operation.name)
-        if prior is not None and parse_version(prior.version) != parse_version(operation.version):
-            op_dir = self._operation_dir(operation.name)
-            if op_dir.exists():
-                shutil.rmtree(op_dir)
-
-        for locus in operation.loci_to_run(present):
-            if not force and self._operation_done(operation, locus):
-                continue
-            self._pending_unstructured = []          # unstructured dirs the op writes this pass
-            res = operation.run(self, locus)
-            if isinstance(res, OperationFailure):
-                warnings.warn(f"Operation {operation.name} failed with error: {res.error}", stacklevel=2)
-                self._write_operation_record(
-                    operation, status="failure", error=res.error,
-                    duration_s=time() - start, ran_loci=ran_loci, output_records=output_records,
-                )
-                return
-            for name, result in res.outputs.items():
-                output_records.append(self._write_output(operation, name, result, locus))
-            output_records.extend(self._pending_unstructured)   # op-written directory outputs
-            ran_loci.append(locus)
-
-        if not ran_loci:
-            warnings.warn(
-                f"Operation {operation.name} v{operation.version} is already complete for all "
-                f"present loci; nothing to run. Pass force=True (or use ds.rerun) to recompute.",
-                stacklevel=2,
-            )
-            return
-
-        self._write_operation_record(
-            operation, status="success", error=None,
-            duration_s=time() - start, ran_loci=ran_loci, output_records=output_records,
-        )
-        self._refresh_operation_results()   # make the just-run op tab-completable
-
-    def _write_output(self, operation: BaseOperation, name: str, result, locus: Optional[str]) -> OutputRecord:
-        kind = _output_kind(result)
-        art = Artifact(operation_relpath(operation.name, name, locus) + _KIND_EXT[kind], kind, role=Role.GENERATED)
-        write_artifact(art, result, self.db_dir)
-        op_prefix = f"{Layout.operations_dir.path}/{operation.name}/"
-        return OutputRecord(name=name, path=art.path[len(op_prefix):], kind=kind.value, locus=locus)
-
-    def _operation_output_dir(self, operation: BaseOperation, name: str, locus: Optional[str] = None) -> Path:
-        """Allocate THE unstructured-output directory for `operation` (one per op, per locus).
-
-        The op writes its files (and any subdirs) here directly, then need not return anything
-        for it — the framework records it as a ``Kind.UNSTRUCTURED`` output after ``_run``.
-        The dir is emptied + created so a forced re-run never inherits stale files. A second
-        call for the same locus raises: an op gets one unstructured dir per locus and should
-        create subdirs inside it if it needs more. Only valid while an op is running (it
-        appends to the per-pass ``_pending_unstructured`` list drained by `run_operation`)."""
-        if any(p.locus == locus for p in self._pending_unstructured):
-            raise ValueError(
-                f"{operation.name} already has an unstructured output dir for locus={locus!r}; "
-                f"an operation gets one per locus — create subdirs inside it instead."
-            )
-        relpath = operation_relpath(operation.name, name, locus)
-        d = self.db_dir / relpath
-        if d.exists():
-            shutil.rmtree(d)
-        d.mkdir(parents=True)
-        op_prefix = f"{Layout.operations_dir.path}/{operation.name}/"
-        self._pending_unstructured.append(
-            OutputRecord(name=name, path=relpath[len(op_prefix):], kind=Kind.UNSTRUCTURED.value, locus=locus)
-        )
-        return d
-
-    def _operation_dir(self, op_name: str) -> Path:
-        return self.db_dir / Layout.operations_dir.path / op_name
-
-    def _read_operation_record(self, op_name: str) -> Optional[OperationRecord]:
-        path = self._operation_dir(op_name) / "operation.json"
-        if not path.exists():
-            return None
-        return OperationRecord.from_dict(json.loads(path.read_text()))
-
-    def _write_operation_record(self, operation: BaseOperation, *, status: str, error: Optional[str],
-                                duration_s: float, ran_loci: List[Optional[str]],
-                                output_records: List[OutputRecord]) -> None:
-        outputs = list(output_records)
-        loci = list(ran_loci)
-        # Merge with a prior successful record so a partial (per-locus) re-run accumulates
-        # loci/outputs rather than clobbering the ones we did not re-run this time.
-        prior = self._read_operation_record(operation.name)
-        if (status == "success" and prior is not None and prior.status == "success"
-                and parse_version(prior.version) == parse_version(operation.version)):
-            outputs += [o for o in prior.outputs if o.locus not in ran_loci]
-            loci += [l for l in (prior.loci or []) if l not in loci]
-
-        record = OperationRecord(
-            operation_name=operation.name,
-            version=operation.version,
-            description=operation.description,
-            ran_at=datetime.now(),
-            duration_s=duration_s,
-            status=status,
-            error=error,
-            params=operation.params(),
-            loci=[l for l in loci if l is not None] or None,
-            outputs=outputs,
-        )
-        path = self._operation_dir(operation.name) / "operation.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(record), indent=2, default=str))
-
-    def _operation_done(self, operation: BaseOperation, locus: Optional[str] = None) -> bool:
-        rec = self._read_operation_record(operation.name)
-        if rec is None or rec.status != "success":
-            return False
-        if parse_version(rec.version) < parse_version(operation.version):
-            return False
-        if locus is not None and (rec.loci is None or locus not in rec.loci):
-            return False
-        return True
-
-    def get_operation_result(self, operation_name: str, output: Optional[str] = None,
-                             locus: Optional[str] = None):
-        """Read one operation output by exact name (deterministic — no substring/suffix guessing).
-
-        ``output=None`` returns the sole/first output; ``locus`` selects a per-locus copy.
-        Raises with the available ``(name, locus)`` pairs on a miss."""
-        rec = self._read_operation_record(operation_name)
-        if rec is None:
-            raise ValueError(f"No operation record found for '{operation_name}'.")
-        if rec.status != "success":
-            raise ValueError(f"Operation '{operation_name}' did not succeed (status={rec.status}).")
-
-        candidates = rec.outputs
-        if locus is not None:
-            candidates = [o for o in candidates if o.locus == locus]
-        if output is not None:
-            candidates = [o for o in candidates if o.name == output]
-        if not candidates:
-            available = [(o.name, o.locus) for o in rec.outputs]
-            raise ValueError(
-                f"No output (name={output!r}, locus={locus!r}) for operation '{operation_name}'. "
-                f"Available (name, locus): {available}"
-            )
-
-        orec = candidates[0]
-        path = self._operation_dir(operation_name) / orec.path
-        if orec.kind == Kind.UNSTRUCTURED.value:
-            return path          # an op-written directory; the caller reads its files itself
-        return _read_output(path, orec.kind)
-
-    def _refresh_operation_results(self) -> None:
-        """(Re)build the autocompleting ``operation_results`` namespace as a **plain attribute**.
-
-        It must be a real attribute (not a ``@property``) holding real sub-attributes, because
-        IPython's completer evaluates the access chain through ``guarded_eval``, whose default
-        ``'limited'`` policy rejects ``@property`` getters and ``__getattr__`` — so a dynamic
-        chain never reaches ``__dir__`` and nothing tab-completes. Rebuilt after each
-        `run_operation` so a newly-run op becomes completable. Discovers ops by scanning
-        ``operations/``; layered on `get_operation_result`."""
-        self.operation_results = OperationResultsNamespace(self)
+        """Run an operation over the loci it supports. Delegates: everything about fan-out,
+        staleness and records lives in `OperationRunner`, which is where an operation's own
+        code can never reach it."""
+        return OperationRunner(self, force=force).run(operation)
 
     def rerun(self, op_cls: type[BaseOperation], **overrides):
-        """Reconstruct an op from its stored params (+ overrides) and re-run it (forced).
+        """Re-run an operation from its recorded config, with overrides. Forced."""
+        return OperationRunner(self).rebuild(op_cls, **overrides)
 
-        Works because dataclass fields == constructor args, so ``op_cls(**stored_params)``
-        rebuilds the op."""
-        rec = self._read_operation_record(op_cls.name)
-        params = (rec.params if rec is not None else {}) or {}
-        return self.run_operation(op_cls(**{**params, **overrides}), force=True)
+    def result(self, art: Artifact, *, locus: Optional[str] = None, **params) -> Handle:
+        """A handle on one operation output.
+
+        The artifact is the operation's own class attribute, so the call names both at once
+        and a typo is an AttributeError:
+
+            ds.result(DiversityReport.diversity_summary, locus="TRB").read()
+
+        The output directory comes from `art.owner.name` — which is why `BaseOperation.
+        artifacts()` refuses an inherited artifact. `locus` defaults to the bound one, so on
+        `ds.select_locus("TRB")` it can be left off entirely."""
+        locus = locus if locus is not None else self._locus("result")
+        if not isinstance(art, Artifact):
+            raise TypeError(
+                f"result() takes an operation's Artifact, not {art!r}. Import the operations "
+                f"namespace and name the output — `from tcr_io import operations as op` then "
+                f"`ds.result(op.FilteringReport.filter_summary)`, which autocompletes and casts. "
+                f"To read by name instead, use raw_result(op_name, output).")
+        if art.owner is None:
+            raise ValueError(f"{art!r} is not declared on an operation class; use raw_result().")
+        return self._op_store(art.owner.name, locus)(art, **params)
+
+    def raw_result(self, op_name: str, output: str, *, locus: Optional[str] = None) -> Handle:
+        """The same read resolved through the record alone — by strings, no class import.
+
+        For datasets produced by a library version whose operation classes you do not have.
+        The record does not store schemas, so this read is uncast."""
+        rec = self._record(op_name, locus if locus is not None else self._locus("raw_result"))
+        if rec is None or rec.status != "success":
+            raise ValueError(f"No successful result for {op_name!r} (locus={locus!r}).")
+        matches = [o for o in rec.outputs if o.name == output]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{op_name!r} has {len(matches)} outputs named {output!r}; "
+                f"available: {sorted({o.name for o in rec.outputs})}"
+            )
+        return self._op_store(op_name, rec.locus)(matches[0].artifact())
+
+    def _op_store(self, op_name: str, locus: str) -> Store:
+        """Root of one (operation, locus) pass — the same binder the runner writes through.
+
+        Built from `self.store`, not from `Store(self.db_dir)`. Every store in the library now
+        descends from the dataset's, so there is one place a root is chosen. `with_root` keeps
+        the bound parameters, and the explicit `locus=` then pins the one that matters — so a
+        locus-bound dataset and an unbound one resolve the same path."""
+        return self.store.with_root(layout.OPERATIONS_DIR, op_name, locus) \
+                         .with_params(locus=locus)
+
+    def _record(self, op_name: str, locus: str) -> Optional[OperationRecord]:
+        return OperationRecord.read(self._op_store(op_name, locus)(OPERATION_RECORD))
 
     @property
     def repertoire_dir(self) -> Path:
-        return self.db_dir / Layout.processed_dir.path
+        return self.path(layout.PROCESSED_DIR)
 
-    def repertoire_meta(self, locus: Optional[str] = None) -> pl.DataFrame:
-        """Per-locus repertoire metadata (Option C). ``locus=None`` returns the concatenation
-        of every present locus (grain: one row per ``(repertoire_id, locus)``); a specific
-        ``locus`` returns just that locus's table (one row per ``repertoire_id``). Callable, not
-        a property, because a multi-locus dataset has no single default table."""
-        loci = sorted(self._present_loci()) if locus is None else [locus]
-        frames = [pl.read_parquet(self.db_dir / repertoire_meta_relpath(l)) for l in loci]
-        df = frames[0] if len(frames) == 1 else pl.concat(frames)
-        return df.select(_schema.REPERTOIRE_META.keys()).cast(_schema.REPERTOIRE_META)
+    @property
+    def repertoire_meta(self) -> pl.DataFrame:
+        """One row per repertoire: source files, patient. A property again, and locus-blind —
+        none of it varies by locus, so there is one table and the binding does not enter."""
+        return self.store(layout.REPERTOIRE_META).read()
 
-    def full_repertoire_meta(self, locus: Optional[str] = None) -> pl.DataFrame:
-        rep = self.repertoire_meta(locus)
+    @property
+    def full_repertoire_meta(self) -> pl.DataFrame:
+        rep = self.repertoire_meta
 
-        extra = self.db_dir / Layout.repertoire_meta_extra.path
-        if extra.exists():
-            rep = rep.join(pl.read_parquet(extra), on="repertoire_id", how="left")
+        extra = self.store(layout.REPERTOIRE_EXTRA).read()
+        return rep if extra is None else rep.join(extra, on="repertoire_id", how="left")
 
-        return rep
+    @property
+    def repertoire_counts(self) -> pl.DataFrame:
+        """Clonotype counts, one row per repertoire.
+
+        The other half of the old single repertoire-meta table, kept separate because it is the
+        half that actually depends on the locus. Bound to a locus: that locus's counts, read
+        straight off its shard. Unbound: the same columns summed across every present locus —
+        still one row per repertoire, whichever loci it appears in.
+
+        Both arms return the SAME schema, which is what lets this be a property. It used to take
+        a `locus` argument and, unbound, concatenate the per-locus tables with an added `locus`
+        column — so an unbound read handed back a different shape *and* a different grain than a
+        bound one, and every caller had to know which it was holding. The per-locus breakdown is
+        now asked for by binding: `ds.select_locus("TRB").repertoire_counts`.
+        """
+        if self.locus:
+            return self.store(layout.REPERTOIRE_COUNTS, locus=self.locus).read()
+        frames = [self.store(layout.REPERTOIRE_COUNTS, locus=l).read()
+                  for l in sorted(self.present_loci)]
+        # A dataset can legitimately hold no real locus — every row landed in `_unassigned`,
+        # which is what a wrong reader looks like. That is an empty table, not an error, and
+        # returning it typed keeps `n_clonotypes` (and so `__repr__`) working on the tree that
+        # most needs looking at.
+        if not frames:
+            return pl.DataFrame(schema=layout.REPERTOIRE_COUNTS.schema)
+        # Summed columns come from the artifact's schema, so a count added there is carried here
+        # without a second list to keep in step. Everything but the key is a count.
+        return (pl.concat(frames)
+                  .group_by("repertoire_id")
+                  .agg([pl.col(c).sum() for c in layout.REPERTOIRE_COUNTS.schema
+                        if c != "repertoire_id"])
+                  .sort("repertoire_id"))
 
     @property
     def patient_meta(self) -> pl.DataFrame:
-        art = Layout.patient_meta
-        return (
-            pl.read_parquet(self.db_dir / art.path)
-            .select(art.schema.keys())
-            .cast(art.schema)
-        )
+        return self.store(layout.PATIENT_META).read()
 
     @property
     def full_patient_meta(self) -> pl.DataFrame:
         pat = self.patient_meta
 
-        extra = self.db_dir / Layout.patient_meta_extra.path
-        if extra.exists():
-            pat = pat.join(pl.read_parquet(extra), on="patient_id", how="left")
-
-        hla = self.db_dir / Layout.hla.path
-        if hla.exists():
-            pat = pat.join(pl.read_parquet(hla), on="patient_id", how="left")
-
+        for side in (layout.PATIENT_EXTRA, layout.HLA):
+            df = self.store(side).read()
+            if df is not None:
+                pat = pat.join(df, on="patient_id", how="left")
         return pat
 
-    # ── side-metadata writers ────────────────────────────────────────────────────
-    # Populate the optional tables that `full_*_meta` joins in. Ideally done during/right after
-    # ingestion, but supported at any time. See docs/superpowers/specs/2026-07-15-metadata-write-api-design.md.
-
-    def set_patient_meta(self, df: pl.DataFrame, *, mode: str = "merge") -> None:
-        """Write extra per-patient metadata (keyed on ``patient_id``), joined into
-        ``full_patient_meta``. ``mode='merge'`` (default) adds new columns/rows without touching
-        existing columns; ``mode='replace'`` overwrites the whole table. See `_set_free_form_meta`
-        for the validation rules."""
-        self._set_free_form_meta(
-            df, key="patient_id", artifact=Layout.patient_meta_extra,
-            base=self.patient_meta, mode=mode, label="set_patient_meta",
-        )
-
-    def set_repertoire_meta(self, df: pl.DataFrame, *, mode: str = "merge") -> None:
-        """Write extra per-repertoire metadata (keyed on ``repertoire_id``), joined into
-        ``full_repertoire_meta`` across every locus. The extra table is locus-agnostic (one row
-        per ``repertoire_id``), so there is no ``locus`` argument. Semantics as `set_patient_meta`."""
-        self._set_free_form_meta(
-            df, key="repertoire_id", artifact=Layout.repertoire_meta_extra,
-            base=self.repertoire_meta(), mode=mode, label="set_repertoire_meta",
-        )
-
-    def _set_free_form_meta(self, df: pl.DataFrame, *, key: str, artifact, base: pl.DataFrame,
-                            mode: str, label: str) -> None:
-        """Shared write path for the two free-form extra tables.
-
-        Validates (duplicate keys -> raise; unknown/missing keys -> warn; columns already present
-        in the base or existing-extra table -> warn + drop), then writes. ``mode='replace'``
-        overwrites; ``mode='merge'`` additively joins the surviving new columns onto the existing
-        table (adding new rows), leaving existing columns untouched."""
-        if mode not in ("merge", "replace"):
-            raise ValueError(f"{label}: mode must be 'merge' or 'replace', got {mode!r}.")
-        if key not in df.columns:
-            raise ValueError(f"{label}: input is missing the '{key}' key column.")
-
-        self._validate_meta_keys(df, key=key, base_keys=base.get_column(key).unique().to_list(), label=label)
-
-        path = self.db_dir / artifact.path
-        existing = pl.read_parquet(path) if (mode == "merge" and path.exists()) else None
-
-        reserved = list(base.columns) + (existing.columns if existing is not None else [])
-        collisions = meta_edit.reserved_column_collisions(df.columns, reserved, key)
-        if collisions:
-            warnings.warn(
-                f"{label}: column(s) {collisions} already exist in the metadata and were skipped; "
-                f"use mode='replace' to overwrite them.",
-                stacklevel=3,
-            )
-            df = df.drop(collisions)
-
-        out = df if existing is None else meta_edit.merge_frames(existing, df, key)
-        write_artifact(artifact, out, self.db_dir)
-
-    def set_hla(self, df: pl.DataFrame) -> None:
-        """Write ground-truth HLA typing (keyed on ``patient_id``), joined into
-        ``full_patient_meta``. Always a full **replace** — HLA's fixed 8-column schema
-        (`schema.HLA_META`) has no room for a column-adding merge.
-
-        Input must already be in canonical notation (bare 4-digit allele strings per locus). Absent
-        loci columns are filled with null-lists (partial typing allowed); columns outside the schema
-        are warned and dropped; `write_artifact` casts to `HLA_META` (a wrong dtype raises). Standard
-        key validation applies (duplicate -> raise, unknown/missing -> warn)."""
-        key = "patient_id"
-        label = "set_hla"
-        if key not in df.columns:
-            raise ValueError(f"{label}: input is missing the '{key}' key column.")
-
-        self._validate_meta_keys(df, key=key, base_keys=self.patient_meta.get_column(key).to_list(), label=label)
-
-        extra_cols = [c for c in df.columns if c not in _schema.HLA_META]
-        if extra_cols:
-            warnings.warn(
-                f"{label}: column(s) {extra_cols} are not part of the HLA schema and were dropped.",
-                stacklevel=2,
-            )
-        # Enforce pre-parsed alleles explicitly: a plain-string locus column would otherwise be
-        # silently wrapped into a 1-element list by the cast ("0201" -> ["0201"]), masking a
-        # notation mistake. set_hla does no parsing, so require List columns up front.
-        non_list = [c for c in _schema.HLA_META if c != key and c in df.columns
-                    and not isinstance(df.schema[c], pl.List)]
-        if non_list:
-            raise ValueError(
-                f"{label}: HLA locus column(s) {non_list} must be List(str) of pre-parsed 4-digit "
-                f"alleles, got {[str(df.schema[c]) for c in non_list]}. set_hla does not parse notation."
-            )
-        missing_loci = [c for c in _schema.HLA_META if c != key and c not in df.columns]
-        if missing_loci:
-            df = df.with_columns([pl.lit(None, dtype=pl.List(pl.Utf8)).alias(c) for c in missing_loci])
-
-        write_artifact(Layout.hla, df, self.db_dir)   # select+cast enforces HLA_META
-
-    def _validate_meta_keys(self, df: pl.DataFrame, *, key: str, base_keys: List[str], label: str) -> None:
-        """Duplicate keys -> raise; keys not in the base (unknown) and base entities not in `df`
-        (missing) -> warn. Shared by every setter."""
-        dups = meta_edit.duplicate_keys(df, key)
-        if dups:
-            raise ValueError(f"{label}: duplicate {key} value(s) in input: {_fmt_ids(dups)}.")
-
-        unknown, missing = meta_edit.check_keys(df.get_column(key).to_list(), base_keys)
-        if unknown:
-            warnings.warn(
-                f"{label}: {len(unknown)} {key}(s) not present in the dataset "
-                f"(rows kept but they will not surface in the join): {_fmt_ids(unknown)}.",
-                stacklevel=3,
-            )
-        if missing:
-            warnings.warn(
-                f"{label}: {len(missing)} {key}(s) in the dataset have no row in the input: "
-                f"{_fmt_ids(missing)}.",
-                stacklevel=3,
-            )
+    @property
+    def metadata(self) -> MetadataWriter:
+        """The metadata write API: `ds.metadata.set_patient(df)`, `.set_repertoire`,
+        `.set_publication`, `.set_hla`. A separate object because writing metadata shares a
+        validation path with nothing on the read side."""
+        return MetadataWriter(self)
 
     @cached_property
     def publication_meta(self) -> dict:
-        art = Layout.publication_ids
-        return (
-            pl.read_ndjson(self.db_dir / art.path, schema=art.schema)
-        ).to_dict(as_series=False)
+        return self.store(layout.PUBLICATION_IDS).read().to_dict(as_series=False)
 
     @cached_property
     def full_publication_meta(self) -> pl.DataFrame:
         pub = pl.DataFrame(self.publication_meta)
 
-        pub_extra = self.db_dir / Layout.publication_meta.path
-        if pub_extra.exists():
-            pub = pub.join(pl.read_parquet(pub_extra), on="publication_id", how="left")
-
-        return pub
+        extra = self.store(layout.PUBLICATION_EXTRA).read()
+        return pub if extra is None else pub.join(extra, on="publication_id", how="left")
 
     @cached_property
     def generation_meta(self) -> dict:
-        art = Layout.generation_meta
-        return (
-            pl.read_ndjson(self.db_dir / art.path, schema=art.schema)
-        ).to_dicts()[0]
+        """How this dataset was ingested: source, mappers, reader, library version, and the
+        filter set applied per locus. Written once at ingestion; see
+        `DatasetIngester._generate_generation_metadata` for what each field is worth."""
+        return self.store(layout.GENERATION_META).read()
 
     @property
     def operations(self) -> List[OperationRecord]:
-        """All per-op records, discovered by scanning ``operations/*/operation.json``."""
-        ops_dir = self.db_dir / Layout.operations_dir.path
-        records = []
-        if ops_dir.exists():
-            for op_json in sorted(ops_dir.glob("*/operation.json")):
-                records.append(OperationRecord.from_dict(json.loads(op_json.read_text())))
-        return records
+        """Every operation record in this dataset, one per (operation, locus).
 
-    def _repertoire_files(self, locus: Optional[str] = None) -> List[Path]:
-        """Processed parquet paths (one per repertoire) for a locus, from the hive partitions
-        ``*/locus={LOCUS}/*.parquet``. ``locus=None`` -> all present loci (excludes `_unassigned`);
-        a specific locus (including ``"_unassigned"``) -> just that partition. The iterator owns
-        locus filtering (E2)."""
-        loci = sorted(self._present_loci()) if locus is None else [locus]
-        files = []
-        for l in loci:
-            files.extend(sorted(self.db_dir.glob(loci_glob(l))))
-        return files
+        One glob: every record sits at `operations/<op>/<locus>/operation.json`, because every
+        operation is locus-grain."""
+        ops_dir = self.db_dir / layout.OPERATIONS_DIR
+        return [OperationRecord.from_dict(json.loads(p.read_text()))
+                for p in sorted(ops_dir.glob("*/*/operation.json"))] if ops_dir.exists() else []
 
-    def read_repertoire(self, repertoire_id: str, locus: Optional[str] = None,
-                        lazy: bool = False, filter_pass_only: bool = False):
-        """Read one repertoire. ``locus=None`` hive-scans the whole repertoire dir and returns a
-        ``locus`` column (recovered from the path) — the paired-chain access path (excludes the
-        `_unassigned` bucket); a specific ``locus`` reads that one partition. Returns a
-        DataFrame (or LazyFrame if ``lazy``)."""
-        if locus is None:
-            lf = pl.scan_parquet(self.db_dir / repertoire_dir_relpath(repertoire_id),
-                                 hive_partitioning=True).filter(pl.col("locus") != UNASSIGNED)
-        else:
-            lf = pl.scan_parquet(self.db_dir / repertoire_locus_relpath(repertoire_id, locus))
-        if filter_pass_only:
-            lf = lf.filter(pl.col("filter_pass"))
+    @property
+    def clonotypes(self) -> pl.LazyFrame:
+        """Every repertoire's passing clonotypes, concatenated, as one lazy frame.
+
+        Bound to a locus, this is that locus's shards read as a single frame: `repertoire_id`
+        is left unbound, so the handle globs `locus={LOCUS}/*.parquet` and scans the lot.
+        Unbound, it is the same per present locus, each part tagged with the locus it came
+        from — tagged *after* the schema cast, which is why this needs neither hive
+        partitioning nor a `locus` column in `REPERTOIRE`.
+
+        `_unassigned` is never included: it is not a locus, and its rows do not pass.
+
+        Passing rows only, which is what the name promises — a clonotype is a row that
+        survived ingest filtering. The unfiltered frame is `ds.store(layout.REPERTOIRE_FILE).scan()`
+        and the per-repertoire loop is `iter_repertoires`; this is the one that answers "all
+        of it, in one frame".
+        """
+        if self.locus:
+            return self.store(layout.REPERTOIRE_FILE).scan().filter(pl.col("filter_reason").is_null())
+        frames = [d.clonotypes.with_columns(pl.lit(d.locus).alias("locus"))
+                  for d in self.each_locus()]
+        # A dataset can legitimately hold no real locus — every row landed in `_unassigned`,
+        # which is what a wrong reader looks like. Typed-empty, for the same reason
+        # `repertoire_counts` returns one: the tree that most needs looking at should still
+        # answer questions about its own shape.
+        if not frames:
+            return pl.LazyFrame(schema={**layout.REPERTOIRE_FILE.schema, "locus": pl.Utf8})
+        return pl.concat(frames)
+
+    def _repertoire_files(self) -> List[Path]:
+        """LOCUS-GRAIN. Processed parquet paths (one per repertoire) for the bound locus, from
+        the hive partitions ``*/locus={LOCUS}/*.parquet``."""
+        self._locus("_repertoire_files")
+        return self.store(layout.REPERTOIRE_FILE).glob()
+
+    def read_repertoire(self, repertoire_id: str, lazy: bool = False,
+                        passing_only: bool = False):
+        """LOCUS-GRAIN. One repertoire's clonotypes on the bound locus. Returns a DataFrame
+        (or LazyFrame if ``lazy``)."""
+        self._locus("read_repertoire")
+        lf = self.store(layout.REPERTOIRE_FILE,
+                        repertoire_id=layout.safe_repertoire_name(repertoire_id)).scan()
+        if passing_only:
+            lf = lf.filter(pl.col("filter_reason").is_null())
         return lf if lazy else lf.collect(engine="streaming")
 
-    def clone_to_cell(self, repertoire_id: Optional[str] = None, lazy: bool = False):
-        """Single-cell clonotype↔cell map, long form ``(repertoire_id, locus, clonotype_id,
-        cell_id)``. ``repertoire_id=None`` -> every single-cell repertoire; a specific id -> just
-        that one. Absent for bulk datasets (returns an empty frame with the `CLONE_TO_CELL` schema).
-        Join back to a clonotype on ``(repertoire_id, locus, clonotype_id)``."""
-        d = self.db_dir / Layout.clone_to_cell_dir.path
-        if repertoire_id is None:
-            files = sorted(d.glob("*.parquet")) if d.exists() else []
-        else:
-            one = self.db_dir / clone_to_cell_relpath(repertoire_id)
-            files = [one] if one.exists() else []
-        lf = pl.scan_parquet(files) if files else pl.LazyFrame(schema=CLONE_TO_CELL)
-        return lf if lazy else lf.collect()
-
-    def iter_repertoires(self, locus:Optional[str]=None, lazy=True, progress_bar=False, filter_pass_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
-        files = self._repertoire_files(locus)
+    def iter_repertoires(self, lazy=True, progress_bar=False, passing_only=True, progress_desc:Optional[str]=None) -> Generator[str, pl.DataFrame | pl.LazyFrame]:
+        """LOCUS-GRAIN. Each repertoire on the bound locus, as ``(repertoire_id, frame)``."""
+        files = self._repertoire_files()
         if progress_bar:
             desc = progress_desc or "Iterating repertoires"
             progress = tqdm(total=len(files), desc=desc)
@@ -595,8 +390,8 @@ class TcrDataset:
         for parquet_file in files:
             repertoire_id = pl.scan_parquet(parquet_file).select(pl.col("repertoire_id").first()).collect()[0, 0]
             df = pl.scan_parquet(parquet_file)
-            if filter_pass_only:
-                df = df.filter(pl.col("filter_pass"))
+            if passing_only:
+                df = df.filter(pl.col("filter_reason").is_null())
             if lazy:
                 yield repertoire_id, df
             else:
@@ -606,34 +401,34 @@ class TcrDataset:
 
     def iter_repertoires_by_patient(
             self,
-            locus:Optional[str]=None,
             deduplicate=True,
-            filter_pass_only=True,
+            passing_only=True,
             lazy=True,
             progress_bar=False,
             progress_desc:Optional[str]=None
             ) -> Generator[Tuple[str, pl.DataFrame | pl.LazyFrame], None, None]:
+        """LOCUS-GRAIN, and patient-keyed. A cross-locus concat of clonotypes is not a thing
+        anyone wants, so this needs the binding like the rest of the repertoire reads."""
+        self._locus("iter_repertoires_by_patient")
         patient_meta = self.full_patient_meta
 
         if progress_bar:
             desc = progress_desc or "Iterating repertoires by patient"
             progress = tqdm(total=patient_meta.select(pl.col("patient_id").n_unique())[0, 0], desc=desc)
 
-        loci = sorted(self._present_loci()) if locus is None else [locus]
-
         for patient, patient_repertoires, in self.patient_meta.select("patient_id", "patient_repertoires").iter_rows():
-            # Rebuild per-locus paths from the (unchanged) repertoire-id list; a repertoire only
-            # has a file for the loci it actually produced, so keep the ones that exist.
+            # Rebuild paths from the (unchanged) repertoire-id list; a repertoire only has a file
+            # for the loci it actually produced, so keep the ones that exist.
             files = [
-                self.db_dir / repertoire_locus_relpath(rep_id, l)
-                for rep_id in patient_repertoires for l in loci
-                if (self.db_dir / repertoire_locus_relpath(rep_id, l)).exists()
+                f for rep_id in patient_repertoires
+                for f in self.store(layout.REPERTOIRE_FILE,
+                                    repertoire_id=layout.safe_repertoire_name(rep_id)).glob()
             ]
             n_files = len(files)
 
             df = pl.concat([pl.scan_parquet(f).with_columns(file=pl.lit(f.name)) for f in files])
-            if filter_pass_only:
-                df = df.filter(pl.col("filter_pass"))
+            if passing_only:
+                df = df.filter(pl.col("filter_reason").is_null())
 
             if deduplicate:
                 if n_files > 1:
@@ -655,21 +450,18 @@ class TcrDataset:
             self,
             fn,
             *,
-            locus: Optional[str] = None,
-            filter_pass_only: bool = True,
+            passing_only: bool = True,
             lazy: bool = True,
             tag_repertoire_id: bool = True,
-            tag_locus: bool = False,
             concat: bool = True,
             schema: Optional[pl.Schema] = None,
             progress_bar: bool = False,
             progress_desc: Optional[str] = None,
         ):
-        """Map ``fn`` over each repertoire, tag ``repertoire_id`` (and optionally ``locus``), and
-        concatenate. Consolidates the "iterate -> apply -> tag -> collect -> concat" loop shared
-        by the per-repertoire ops, and is the single place the locus loop + locus tagging live
-        (E2): ``locus=None`` spans all present loci, an op forwards the ``locus`` it was handed in
-        ``_run(ds, locus)``.
+        """LOCUS-GRAIN. Map ``fn`` over each repertoire on the bound locus, tag
+        ``repertoire_id``, and concatenate. Consolidates the "iterate -> apply -> tag -> collect
+        -> concat" loop shared by the per-repertoire ops. No locus tagging: every row came from
+        the one bound locus, so the column would be a constant the caller already knows.
 
         Each repertoire's (small) result is **collected eagerly, one at a time**, then the eager
         parts are concatenated — this bounds the working set to a single repertoire and does NOT
@@ -680,19 +472,12 @@ class TcrDataset:
         given, else raises."""
         parts = []
         for rep_id, rep in self.iter_repertoires(
-            locus=locus, lazy=lazy, filter_pass_only=filter_pass_only,
+            lazy=lazy, passing_only=passing_only,
             progress_bar=progress_bar, progress_desc=progress_desc,
         ):
             part = fn(rep)
-            tags = []
             if tag_repertoire_id:
-                tags.append(pl.lit(rep_id).alias("repertoire_id"))
-            if tag_locus:
-                if locus is None:
-                    raise ValueError("map_repertoires(tag_locus=True) requires a specific locus, not None.")
-                tags.append(pl.lit(locus).alias("locus"))
-            if tags:
-                part = part.with_columns(*tags)
+                part = part.with_columns(pl.lit(rep_id).alias("repertoire_id"))
             if isinstance(part, pl.LazyFrame):
                 part = part.collect(engine="streaming")   # per-repertoire collect: bounded memory
             parts.append(part)
@@ -703,15 +488,16 @@ class TcrDataset:
             if schema is not None:
                 return pl.DataFrame(schema=schema)
             raise ValueError(
-                f"map_repertoires produced no repertoires (locus={locus!r}); pass schema= to "
+                f"map_repertoires produced no repertoires (locus={self.locus!r}); pass schema= to "
                 f"get a typed-empty frame instead of raising."
             )
         return pl.concat(parts)
 
     @cached_property
     def n_repertoires(self):
-        """Number of samples: unique ``repertoire_id`` across all loci (grain unchanged)."""
-        return self.repertoire_meta().select(pl.col("repertoire_id").n_unique())[0, 0]
+        """Number of samples. One row per repertoire in `repertoire_meta` now, so this is a
+        height — the `n_unique()` it replaces was deduplicating the per-locus concat."""
+        return self.repertoire_meta.height
 
     @cached_property
     def n_patients(self):
@@ -719,81 +505,13 @@ class TcrDataset:
 
     @cached_property
     def n_clonotypes(self):
-        """Total passing clonotypes summed across every locus."""
-        return self.repertoire_meta().select(pl.sum("n_clonotypes"))[0, 0]
+        """Total passing clonotypes: the bound locus's, or summed over every locus."""
+        return self.repertoire_counts.select(pl.sum("n_clonotypes"))[0, 0]
     
     def __repr__(self):
-        return f"""Processed Dataset \'{self.db_name}\', dataset v{self.version}, 
-        present loci {sorted(self._present_loci())},
+        bound = f" [locus={self.locus}]" if self.locus else ""
+        return f"""Processed Dataset \'{self.db_name}\'{bound}, dataset v{self.version}, 
+        present loci {sorted(self.present_loci)},
         created_on {self.generation_meta['created_on']}, 
         {self.n_clonotypes} clonotypes ({self.n_repertoires} repertoires, {self.n_patients} patients),
         """
-
-
-class OperationResultsNamespace:
-    """`ds.operation_results` — attribute access to operation outputs.
-
-    Each successful op is set as a **real attribute** (an `OperationHandle`) at construction, so
-    IPython's `guarded_eval` completer can traverse ``ds.operation_results.<op>...`` under its
-    default ``'limited'`` policy (which rejects ``@property``/``__getattr__`` hops). `ds` rebuilds
-    this namespace after each run (`_refresh_operation_results`), so new ops appear. `__getattr__`
-    stays as a fallback for ops written after this namespace was built."""
-    def __init__(self, ds: TcrDataset):
-        self._ds = ds
-        ops_dir = ds.db_dir / Layout.operations_dir.path
-        if ops_dir.exists():
-            for p in sorted(ops_dir.glob("*/operation.json")):
-                op_name = p.parent.name
-                if op_name.startswith("_"):
-                    continue
-                rec = ds._read_operation_record(op_name)
-                if rec is not None and rec.status == "success":
-                    setattr(self, op_name, OperationHandle(ds, rec))
-
-    # NB: deliberately NO __getattr__ — its mere presence on the class makes IPython's
-    # guarded_eval refuse to traverse this object during completion (limited mode), so the
-    # chain never reaches `__dir__`. Ops are real attributes (above), refreshed after each run.
-
-    def __dir__(self):
-        ops_dir = self._ds.db_dir / Layout.operations_dir.path
-        names = [p.parent.name for p in ops_dir.glob("*/operation.json")] if ops_dir.exists() else []
-        return list(super().__dir__()) + names
-
-
-class OperationHandle:
-    """One operation's outputs. ``.<output>`` -> the frame (or `Path`); ``.<locus>.<output>`` for
-    locus-aware ops.
-
-    Loci are set as **real attributes** (sub-handles) so `guarded_eval` can traverse them during
-    completion; outputs stay lazy (`__getattr__`) so no frame is loaded just to complete a name
-    (the completer only ``dir()``s this handle, it never evaluates the leaf). ``__dir__`` lists
-    outputs (+ loci) for tab-completion."""
-    def __init__(self, ds: TcrDataset, rec: OperationRecord, locus: Optional[str] = None):
-        object.__setattr__(self, "_ds", ds)
-        object.__setattr__(self, "_rec", rec)
-        object.__setattr__(self, "_locus", locus)
-        if locus is None:
-            for loc in self._loci():                      # real sub-handle per locus (completable)
-                object.__setattr__(self, loc, OperationHandle(ds, rec, locus=loc))
-
-    def _loci(self) -> List[str]:
-        return sorted({o.locus for o in self._rec.outputs if o.locus is not None})
-
-    def _output_names(self) -> List[str]:
-        return sorted({o.name for o in self._rec.outputs
-                       if self._locus is None or o.locus == self._locus})
-
-    def __getattr__(self, x: str):
-        if x.startswith("_"):
-            raise AttributeError(x)
-        if self._locus is None and x in self._loci():
-            return OperationHandle(self._ds, self._rec, locus=x)
-        if x in {o.name for o in self._rec.outputs}:
-            return self._ds.get_operation_result(self._rec.operation_name, x, locus=self._locus)
-        raise AttributeError(x)
-
-    def __dir__(self):
-        extra = self._output_names()
-        if self._locus is None:
-            extra = extra + self._loci()
-        return list(super().__dir__()) + extra

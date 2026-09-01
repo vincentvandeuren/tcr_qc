@@ -9,9 +9,10 @@ from typing import List, Literal, Optional
 import polars as pl
 from scipy.stats import fisher_exact
 
-from .base import ALL_LOCI, BaseOperation, OperationResults
+from .base import BaseOperation
 from .tabulate import TabulateByVJ
-from ..expressions import extract_genes
+from ..expressions import KNOWN_LOCI, extract_genes
+from ..structure import Artifact, Format, Store
 
 
 @lru_cache(maxsize=1_000_000)
@@ -31,8 +32,9 @@ _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 @dataclass
 class FisherTest:
-    """One association test config. `name` is the output name (a safe identifier — it becomes
-    an ``operations/fisher_association/<locus>/<name>.parquet`` file and a tab-completable attr).
+    """One association test config. `name` is a safe identifier that becomes the `{test}`
+    parameter of `FisherAssociation.association` — i.e. one
+    ``operations/fisher_association/<locus>/<name>.parquet`` file per test.
 
     The binary label is derived from ``label_column`` (a column of ``full_patient_meta`` or
     ``full_repertoire_meta``): rows whose value is in ``positive`` -> True; rows in ``negative``
@@ -69,7 +71,13 @@ class FisherAssociation(BaseOperation):
     name = "fisher_association"
     version = "0.1"
     description = "Emerson associated-TCR test: per-clonotype Fisher-exact association of clone presence with a binary phenotype label."
-    supported_loci = ALL_LOCI
+    supported_loci = KNOWN_LOCI
+
+    # One table per configured test. Parameterised because the test list is config, not code:
+    # the number of outputs is only known once the op is constructed, so it cannot be a fixed
+    # set of class attributes. The runner records what was written rather than what was
+    # declared, so zero tests is a legal (empty) result rather than a missing output.
+    association = Artifact("{test}.parquet", Format.PARQUET)
 
     tests: Optional[List[FisherTest]] = None        # set in __post_init__ (mutable default guard)
     grain: Literal["patient", "repertoire"] = "patient"
@@ -112,11 +120,11 @@ class FisherAssociation(BaseOperation):
             .sort("p_value")
         )
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        tab_dir = self._ensure_tabulated(ds, locus)
+    def _run(self, ds, out: Store) -> None:
+        tab_dir = self._ensure_tabulated(ds)
         key = "patient_id" if self.grain == "patient" else "repertoire_id"
 
-        meta = ds.full_patient_meta if self.grain == "patient" else ds.full_repertoire_meta(locus)
+        meta = ds.full_patient_meta if self.grain == "patient" else ds.full_repertoire_meta
         missing = [t.label_column for t in self.tests if t.label_column not in meta.columns]
         if missing:
             raise ValueError(
@@ -130,32 +138,30 @@ class FisherAssociation(BaseOperation):
 
         incidence = self._incidence(ds, tab_dir, key, labels)   # name -> incidence DataFrame
 
-        outputs = {}
         for t in self.tests:
             tp, tn = totals[t.name]
-            outputs[t.name] = self._associate(incidence[t.name], tp, tn, t.alternative)
-        return OperationResults(outputs=outputs)
+            out(self.association, test=t.name).write(
+                self._associate(incidence[t.name], tp, tn, t.alternative)
+            )
 
-    def _ensure_tabulated(self, ds, locus) -> Path:
-        """Return the TabulateByVJ 'tabulated' dir for this locus, running the op (to its normal
-        operations/ location) first if it isn't there yet."""
-        try:
-            return ds.get_operation_result("tabulate_by_vj_gene", "tabulated", locus=locus)
-        except ValueError:
+    def _ensure_tabulated(self, ds) -> Path:
+        """The TabulateByVJ output directory for this locus, running that op first if it is not
+        there yet.
+
+        The nested run goes through the runner like any other, so the directory is recorded
+        against `tabulate_by_vj_gene` and cannot leak into this op's own outputs. `ds` is bound
+        to one locus, and the runner fans out over the binding, so this costs one locus.""" 
+        handle = ds.result(TabulateByVJ.tabulated)
+        if not handle.exists():
             ds.run_operation(TabulateByVJ())
-            # the nested run_operation repopulated ds._pending_unstructured for TabulateByVJ; clear
-            # it so the outer run_operation drain (dataset.py:209) does not attribute the tabulated
-            # dir to this op. FisherAssociation writes no unstructured outputs of its own.
-            ds._pending_unstructured = []
-            return ds.get_operation_result("tabulate_by_vj_gene", "tabulated", locus=locus)
+        return handle.path()
 
     def _incidence(self, ds, tab_dir: Path, key: str, labels: dict) -> dict:
         """Per-test per-clone (v_gene, j_gene, junction_aa) -> n_positive / n_negative, built one
         (v_gene, j_gene) shard at a time. A label-independent per-subject presence table is built
         once per shard and reused across every test (shared scan). Returns {test_name: DataFrame}."""
-        rep2subject = (ds.repertoire_meta()                      # locus-agnostic repertoire->patient map
-                       .select("repertoire_id", "patient_id").unique()
-                       if key == "patient_id" else None)
+        rep2subject = (ds.repertoire_meta.select("repertoire_id", "patient_id")
+                       if key == "patient_id" else None)   # already one row per repertoire
         parts = {name: [] for name in labels}
         for v_dir in sorted(tab_dir.iterdir()):
             for j_dir in sorted(v_dir.iterdir()):

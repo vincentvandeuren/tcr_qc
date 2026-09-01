@@ -6,14 +6,22 @@ whose defaults *are* the pre-versioning (v0) state, so an absent file just const
 default -- "no manifest => v0" needs no special-casing.
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field, fields
-import json
-from pathlib import Path
-from typing import List
+from dataclasses import dataclass, asdict, fields
 
-from .._internal import __version__ as _tcrio_version
+from .layout import MANIFEST
+from .store import Store
 
-DATASET_VERSION = 5   # v5: per-(repertoire, locus) `clonotype_id` in REPERTOIRE (row number within each
+DATASET_VERSION = 7   # v7: the ingest record moves to `meta/generation.json` (a JSON object, not a
+                      #     one-row NDJSON table) and absorbs `tcrio_version` and `filters` from the
+                      #     manifest — one record answering "how was this dataset made". The manifest
+                      #     is left holding `version` alone.
+                      # v6: locus-first shards (processed_repertoires/locus={L}/{id}.parquet); repertoire
+                      #     meta split by grain (meta/repertoire/repertoire.parquet +
+                      #     locus={L}/counts.parquet); side tables renamed to extra.parquet; the two
+                      #     NDJSON files renamed off `.json`; `filter_pass` -> `filter_reason`;
+                      #     `present_loci` dropped from the manifest (it is the shard listing);
+                      #     operations/ cleared, since every result is regenerable.
+                      # v5: per-(repertoire, locus) `clonotype_id` in REPERTOIRE (row number within each
                       #     locus partition); single-cell datasets also write meta/clone_to_cell/{id}.parquet
                       #     (repertoire_id, locus, clonotype_id, cell_id). Migration backfills clonotype_id
                       #     per hive file.
@@ -30,29 +38,31 @@ IMGT_VERSION = "202614-2 (31 March 2026)"  # data releseas: https://www.imgt.org
 
 @dataclass(frozen=True)
 class Manifest:
+    """The version, and nothing else.
+
+    `tcrio_version` and `filters` used to live here. Both describe how a dataset was *made*,
+    which is the ingest record's question (`meta/generation.json`) — and neither had a reader
+    while it sat here. The manifest is for what the tree cannot say about itself, and the
+    version is the whole of that.
+    """
     version: int = 0                    # 0 == pre-versioning dataset (no manifest on disk)
-    tcrio_version: str = ""             # library version that last wrote it
-    present_loci: List[str] = field(default_factory=list)   # loci in this dataset, fixed at ingest
-    # Filter provenance recorded at ingest: {"<LOCUS>": <set>, ...} — one entry per accepted locus,
-    # where each <set> is {"preset": <name|null>, "filters": [<filter names>]}. Loci absent from the
-    # map were not accepted (all rows filtered). Empty for pre-provenance datasets -> report falls
-    # back to the default preset.
-    filters: dict = field(default_factory=dict)
 
     @classmethod
-    def read(cls, path: str | Path) -> "Manifest":
-        path = Path(path)
-        if not path.exists():
-            return cls()                       # <- "no manifest => v0"
-        data = json.loads(path.read_text())
+    def read(cls, store: Store) -> "Manifest":
+        """`MANIFEST` is `on_missing=NONE`, so an absent file reads as `None` and constructs
+        the defaults — "no manifest => v0" needs no branch here."""
         known = {f.name for f in fields(cls)}
+        data = store(MANIFEST).read() or {}
         return cls(**{k: v for k, v in data.items() if k in known})   # forward-compatible
 
     @classmethod
-    def current(cls, present_loci: List[str] | None = None,
-                filters: dict | None = None) -> "Manifest":
-        return cls(version=DATASET_VERSION, tcrio_version=_tcrio_version,
-                   present_loci=sorted(present_loci or []), filters=filters or {})
+    def current(cls) -> "Manifest":
+        return cls(version=DATASET_VERSION)
 
-    def write(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(asdict(self), indent=2))
+    def write(self, store: Store) -> None:
+        """Whole-value write, for the one writer that holds the whole value: ingestion.
+
+        `Migrator` still commits through `store(MANIFEST).update(...)`. Not because ownership
+        is split any more — it is not — but because a walk must preserve keys a LATER version
+        adds, which this version cannot know to carry."""
+        store(MANIFEST).write(asdict(self))

@@ -1,13 +1,11 @@
 # copy code from baseline technical features model
 from __future__ import annotations
-from .base import ALL_LOCI, BaseOperation, OperationResults
+from .base import BaseOperation
+from ..expressions import KNOWN_LOCI
+from ..structure import Artifact, Format, Store
 from ..expressions import _determine_reference_points
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional
 import polars as pl
-
-if TYPE_CHECKING:
-    from ..dataset import TcrDataset
 
 
 def moment_aggs(col: str) -> list[pl.Expr]:
@@ -69,14 +67,12 @@ class VdjStatisticsSummary(BaseOperation):
     name = "vdj_statistics_summary"
     version = "0.2"     # v0.2: TRB D-features changed — the Rust D-index no longer pools TRD D-genes into TRB
     description = "Generates a report summarizing inferred likely VDJ trimming and insertion metrics across repertoires."
-    supported_loci = ALL_LOCI
+    supported_loci = KNOWN_LOCI
 
+    vdj_statistics_summary = Artifact("vdj_statistics_summary.parquet", Format.PARQUET)
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
-        vdj_stat_summ = ds.map_repertoires(
-            determine_trim_features, locus=locus, filter_pass_only=True,
+    def _run(self, ds, out: Store) -> None:
+        out(self.vdj_statistics_summary).write(ds.map_repertoires(
+            determine_trim_features, passing_only=True,
             progress_bar=True, progress_desc="Computing VDJ trimming/insertion metrics",
-        )
-        return OperationResults(outputs={
-            "vdj_statistics_summary": vdj_stat_summ,
-        })
+        ))

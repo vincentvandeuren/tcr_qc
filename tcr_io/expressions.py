@@ -11,7 +11,8 @@ KNOWN_LOCI: frozenset = frozenset({"TRA", "TRB", "TRG", "TRD", "IGH", "IGK", "IG
 # Sentinel locus value for rows whose locus can't be derived (null/invalid v_call or j_call, or a
 # prefix outside KNOWN_LOCI). It is a real `locus` value so `pl.PartitionBy` writes those rows to a
 # `locus=_unassigned/` partition (instead of polars' __HIVE_DEFAULT_PARTITION__), kept for QC. The
-# leading underscore marks it "not a real locus": `_present_loci` and op fan-out exclude it.
+# leading underscore marks it "not a real locus": `present_loci` excludes it (`dispatch_loci`,
+# which is what op fan-out runs over, does not — the QC bucket gets a filtering report).
 UNASSIGNED: str = "_unassigned"
 
 def get_filename(

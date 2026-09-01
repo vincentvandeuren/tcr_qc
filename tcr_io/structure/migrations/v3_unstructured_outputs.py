@@ -14,12 +14,14 @@ This migration deletes:
 Both are generated / rebuildable, so deletion is safe (clear & regenerate, as for v2).
 """
 import shutil
+from pathlib import Path
 
 from .base import migration
-from ..layout import Layout
+
+_V3_OPERATIONS_DIR = "operations"        # pinned; not Layout.operations_dir
 
 
-def _rm(path) -> None:
+def _rm(path: Path) -> None:
     if path.is_dir():
         shutil.rmtree(path)
     elif path.exists():
@@ -27,6 +29,6 @@ def _rm(path) -> None:
 
 
 @migration(to_version=3, description="Fold hive outputs into unstructured dirs; drop legacy temp/")
-def upgrade(ds):
-    _rm(ds.db_dir / Layout.operations_dir.path / "tabulate_by_vj_gene")
-    _rm(ds.db_dir / "temp")
+def upgrade(db_dir: Path) -> None:
+    _rm(db_dir / _V3_OPERATIONS_DIR / "tabulate_by_vj_gene")
+    _rm(db_dir / "temp")

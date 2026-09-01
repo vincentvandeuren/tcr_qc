@@ -33,7 +33,7 @@ ds = ingester.run("path/to/repertoire/files/*.tsv")
 # Run a QC operation
 from tcr_io.operations import GeneCountsSummary
 ds.run_operation(GeneCountsSummary())
-print(ds.get_operation_result("gene_counts_summary"))
+print(ds.result(GeneCountsSummary.gene_counts, locus="TRB").read())
 ```
 
 ## Dataset layout
@@ -42,39 +42,30 @@ A dataset is a directory with this on-disk structure:
 
 ```
 my_dataset/
-├── processed_repertoires/      # One parquet per repertoire. Atomic unit.
-│   ├── sample_001.parquet      # Standardized schema, repertoire_id column
-│   └── sample_002.parquet
-│
-├── tabulated/                  # Hive-partitioned. Generated, deletable, rebuildable.
-│   ├── v_gene=TRBV7-2/
-│   │   └── j_gene=TRBJ2-1/
-│   │       └── my_dataset.parquet
-│   └── ...
+├── processed_repertoires/          # One directory per repertoire, hive-partitioned by locus.
+│   └── sample_001/                 # Atomic unit: standardized schema, repertoire_id column.
+│       ├── locus=TRB/sample_001.parquet
+│       └── locus=TRA/sample_001.parquet
 │
 ├── meta/
+│   ├── manifest.json           # Dataset version, present loci, ingest filter provenance.
 │   ├── generation.json         # One row per dataset generation. When, how, source, etc.
-│   ├── operations.json         # One row per operation performed on this dataset.
 │   ├── repertoire/
-│   │   ├── repertoire.parquet       # One row per repertoire. IDs, counts, source files, patient_ids.
+│   │   ├── TRB.parquet              # One row per repertoire on this locus. IDs, counts.
 │   │   └── repertoire_meta.parquet  # Optional extra metadata (join on repertoire_id).
 │   ├── patient/
 │   │   ├── patient.parquet           # One row per patient. Aggregated stats.
 │   │   ├── patient_meta.parquet      # Optional extra metadata (join on patient_id).
-│   │   ├── hla.parquet               # Optional. Known HLA typing.
-│   │   └── inferred_hla.parquet      # Optional. Computationally inferred.
-│   └── publication/
-│       ├── publication_ids.json      # DOI(s) / pubmed_id(s) for associated publications.
-│       ├── pdfs/                     # Optional publication PDFs.
-│       └── publication.parquet       # Generated, fetched metadata cached here.
+│   │   └── hla.parquet               # Optional. Known HLA typing.
+│   ├── publication/
+│   │   ├── publication_ids.json      # DOI(s) / pubmed_id(s) for associated publications.
+│   │   └── publication.parquet       # Generated, fetched metadata cached here.
+│   └── clone_to_cell/                # Single-cell datasets only: clonotype <-> cell map.
 │
-├── qc/                         # Generated. QC metric tables + plots.
-│   ├── repertoire_stats.parquet
-│   ├── gene_usage.parquet
-│   ├── overlap.parquet
-│   └── repertoire_stats.png
-│
-└── README.md                   # Optional. Auto-generated dataset card.
+└── operations/                 # Generated, deletable, rebuildable.
+    └── <operation>/<LOCUS>/    # One pass per (operation, locus); no locus segment when
+        ├── operation.json      # the operation is locus-agnostic.
+        └── *.parquet           # The pass's declared outputs, read back via `ds.result()`.
 ```
 
 ## Bundled models

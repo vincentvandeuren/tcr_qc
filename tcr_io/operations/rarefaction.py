@@ -1,9 +1,10 @@
 import polars as pl
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional
 from scipy.special import gammaln
-from .base import ALL_LOCI, BaseOperation, OperationResults
+from .base import BaseOperation
+from ..expressions import KNOWN_LOCI
+from ..structure import Artifact, Format, Store
 
 
 def get_fixed_depth_grid(num_points: int = 200, max_depth: int = 10_000_000) -> np.ndarray:
@@ -165,24 +166,22 @@ class RarefactionReport(BaseOperation):
     name = "rarefaction_report"
     version = "0.1"
     description = "Rarefaction/extrapolation curves per repertoire."
-    supported_loci = ALL_LOCI
+    supported_loci = KNOWN_LOCI
+
+    rarefaction_curves = Artifact("rarefaction_curves.parquet", Format.PARQUET)
 
     num_points: int = 200
     max_depth: int = 10_000_000
     extrapolation: bool = True
 
-    def _run(self, ds, locus: Optional[str] = None) -> OperationResults:
+    def _run(self, ds, out: Store) -> None:
         # Compute grid once — shared by all samples
         depth_grid = get_fixed_depth_grid(num_points=self.num_points, max_depth=self.max_depth)
 
-        result = ds.map_repertoires(
+        out(self.rarefaction_curves).write(ds.map_repertoires(
             lambda rep: compute_rarefaction_curve(
                 rep, depth_grid=depth_grid, extrapolation=self.extrapolation,
             ),
-            locus=locus, filter_pass_only=True, progress_bar=True,
+            passing_only=True, progress_bar=True,
             progress_desc="Computing rarefaction",
-        )
-
-        return OperationResults(outputs={
-            "rarefaction_curves": result,
-        })
+        ))

@@ -196,7 +196,7 @@ class BaseReader(ABC):
 class MixcrReader(BaseReader):
     name = "mixcr"
     col_map = {
-        "nSeqCDR3": "junction",
+        ("nSeqCDR3", 'targetSequences'): "junction",
         "aaSeqCDR3": "junction_aa",
         ("allVHitsWithScore", "bestVGene"): "v_call",
         ("allJHitsWithScore", "bestJGene"): "j_call",

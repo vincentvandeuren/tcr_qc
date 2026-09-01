@@ -1,51 +1,25 @@
-"""Dataset **format contract**: what tables exist (`schema`), where they live
-(`layout`), what version the format is (`version`), and how to move between versions
-(`migrations`). Everything else in `tcr_io` is behaviour over this contract.
+"""Dataset structure: what a dataset holds, where it lives, and how it is read and written.
 
-Common names are re-exported here, so callers can `from tcr_io.structure import Layout,
-REPERTOIRE_META, DATASET_VERSION`. The `migrations` subpackage is imported lazily by its
-users (not here) to keep the pkgutil auto-import off the `import tcr_io` path.
+  schema.py   the column sets
+  store.py    Artifact / Handle / Store — the only code that touches the filesystem
+  layout.py   every well-known path, declared once as an Artifact
+  version.py  the on-disk version and its manifest
+  migrations/ upgrades between versions, each pinned to its own era's literals
+
+Schemas are reached through the `schema` module (`schema.REPERTOIRE_META`), never re-exported
+flat: half the artifacts share a name with the schema they carry, and the two are not
+interchangeable.
 """
-from . import schema
-from . import meta_edit
-from .schema import (
-    GENERATION_META,
-    REPERTOIRE,
-    REPERTOIRE_META,
-    PATIENT_META,
-    PUBLICATION_META,
-    CLONE_TO_CELL,
-    HLA_META,
-)
+from . import schema, meta_edit
+from .store import Artifact, Format, OnMissing, Handle, Store, resolve, required_dirs
 from .layout import (
-    Artifact,
-    Kind,
-    Role,
-    Layout,
-    LAYOUT,
-    REQUIRED_DIRS,
-    GENERATED_DIRS,
-    repertoire_dir_relpath,
-    repertoire_locus_relpath,
-    clone_to_cell_relpath,
-    loci_glob,
-    repertoire_meta_relpath,
-    operation_relpath,
+    ARTIFACTS, OPERATIONS_DIR,
+    PROCESSED_DIR, LOCUS_DIR, REPERTOIRE_FILE,
+    REPERTOIRE_META, REPERTOIRE_COUNTS, PATIENT_META, PUBLICATION_IDS, GENERATION_META,
+    MANIFEST,
+    REPERTOIRE_EXTRA, PATIENT_EXTRA, PUBLICATION_EXTRA, HLA,
+    CLONE_TO_CELL_DIR, CLONE_TO_CELL,
     safe_repertoire_name,
-    render_tree,
 )
-from .writers import write_artifact
 from .version import DATASET_VERSION, Manifest
-
-__all__ = [
-    "schema", "meta_edit",
-    "GENERATION_META", "REPERTOIRE", "REPERTOIRE_META", "PATIENT_META",
-    "PUBLICATION_META", "CLONE_TO_CELL", "HLA_META",
-    "Artifact", "Kind", "Role", "Layout", "LAYOUT",
-    "REQUIRED_DIRS", "GENERATED_DIRS",
-    "repertoire_dir_relpath", "repertoire_locus_relpath", "clone_to_cell_relpath",
-    "loci_glob", "repertoire_meta_relpath",
-    "operation_relpath", "safe_repertoire_name", "render_tree",
-    "write_artifact",
-    "DATASET_VERSION", "Manifest",
-]
+from .migrations import Migrator

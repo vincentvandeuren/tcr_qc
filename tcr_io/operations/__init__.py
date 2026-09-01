@@ -1,8 +1,7 @@
-from .base import *
+from .base import BaseOperation, NullOperation
 from .filtering_report import FilteringReport
 from .hla import RepertoireHlaInference, HlaInference
 from .overlap import OverlapAnalyzer
-from .metadata import MetadataFetcher
 from .tabulate import TabulateByVJ
 from .diversity import DiversityReport
 from .vdj_statistics import VdjStatisticsSummary

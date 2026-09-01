@@ -1,6 +1,6 @@
-"""Pure helpers for the metadata write path (`TcrDataset.set_*_meta` / `set_hla`).
+"""Pure helpers for the metadata write path (`Dataset.set_*_meta` / `set_hla`).
 
-These are deliberately side-effect-free set/frame operations: the `TcrDataset` methods do the
+These are deliberately side-effect-free set/frame operations: the `Dataset` methods do the
 I/O (read old table, warn, `write_artifact`) and decide warn-vs-raise; everything decidable from
 the frames alone lives here so it can be unit-tested without a dataset on disk.
 
