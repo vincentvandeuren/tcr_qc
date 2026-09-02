@@ -10,7 +10,7 @@ Schemas are reached through the `schema` module (`schema.REPERTOIRE_META`), neve
 flat: half the artifacts share a name with the schema they carry, and the two are not
 interchangeable.
 """
-from . import schema, meta_edit
+from . import schema
 from .store import Artifact, Format, OnMissing, Handle, Store, resolve, required_dirs
 from .layout import (
     ARTIFACTS, OPERATIONS_DIR,
