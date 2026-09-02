@@ -1,14 +1,4 @@
-"""`MetadataWriter` — every supported edit to an existing dataset's metadata.
-
-Split off the read class because these are the only writes a *user* makes to a dataset that
-already exists, and they share one validation path that has nothing to do with reading: keys
-must be unique, must name entities the dataset actually has, and must not collide with a
-column the library owns.
-
-Layering: the frame algebra lives one level down in `structure.meta_edit`, side-effect-free and
-unit-testable without a dataset on disk. This module is the half that does I/O and decides
-warn-versus-raise. It reads through a `Dataset` rather than a bare `Store` because validation
-needs the canonical tables the new rows are checked against.
+"""`MetadataWriter` — supported edits by user to an existing dataset's metadata.
 
 Reached as `ds.metadata`:
 
@@ -21,16 +11,64 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 import polars as pl
 
 from .publications import fetch_publication
 from .structure import layout, Artifact
-from .structure import meta_edit, schema as _schema
+from .structure import schema as _schema
 
-if TYPE_CHECKING:                       # type-only: no runtime import, no cycle
+if TYPE_CHECKING:
     from .dataset import Dataset
+
+
+
+def _duplicate_keys(df: pl.DataFrame, key: str) -> List[str]:
+    """Values of `key` that appear more than once in `df` (each reported once)."""
+    return (
+        df.lazy()
+        .select(key)
+        .filter(pl.col(key).is_duplicated())
+        .unique()
+        .collect()
+        .get_column(key)
+        .drop_nulls()
+        .to_list()
+    )
+
+
+def _check_keys(new_keys: Iterable[str], base_keys: Iterable[str]) -> Tuple[List[str], List[str]]:
+    """Split key membership relative to the dataset's base entities.
+
+    Returns ``(unknown, missing)`` where ``unknown`` = keys in `new_keys` absent from the base
+    (likely typos — the reader left-join would silently drop them) and ``missing`` = base keys
+    absent from `new_keys` (entities left without metadata by this call). Both sorted."""
+    new_set = set(new_keys)
+    base_set = set(base_keys)
+    unknown = sorted(new_set - base_set)
+    missing = sorted(base_set - new_set)
+    return unknown, missing
+
+
+def _reserved_column_collisions(new_cols: Iterable[str], reserved_cols: Iterable[str], key: str) -> List[str]:
+    """Non-key columns of `new_cols` whose name already appears in `reserved_cols`.
+
+    ``reserved_cols`` is the base table's columns (always) plus, in merge mode, the existing
+    extra table's columns. A collision would either clash with a base column on the reader's
+    join or fail to overwrite in an additive merge, so the caller warns and drops these."""
+    reserved = set(reserved_cols) - {key}
+    return [c for c in new_cols if c != key and c in reserved]
+
+
+def _merge_frames(old: pl.DataFrame, new: pl.DataFrame, key: str) -> pl.DataFrame:
+    """Additively merge `new` into `old` on `key`.
+
+    Full outer join, coalescing the key so no ``*_right`` column appears. `new` is expected to
+    hold only `key` plus columns **not** already in `old` (the caller strips collisions), so the
+    join adds new columns and new rows while leaving every existing `old` column untouched. Cells
+    with no value after the join are null."""
+    return old.join(new, on=key, how="full", coalesce=True)
 
 
 def _fmt_ids(ids: Iterable[str], cap: int = 10) -> str:
@@ -40,7 +78,6 @@ def _fmt_ids(ids: Iterable[str], cap: int = 10) -> str:
     if len(ids) > cap:
         shown.append(f"... (+{len(ids) - cap} more)")
     return "[" + ", ".join(shown) + "]"
-
 
 class MetadataWriter:
     """Writes the optional side tables that `full_*_meta` joins in.
@@ -97,7 +134,7 @@ class MetadataWriter:
         existing = self._ds.store(art).read() if mode == "merge" else None
 
         reserved = list(base.columns) + (existing.columns if existing is not None else [])
-        if collisions := meta_edit.reserved_column_collisions(df.columns, reserved, key):
+        if collisions := _reserved_column_collisions(df.columns, reserved, key):
             warnings.warn(
                 f"{label}: column(s) {collisions} already exist in the metadata and were skipped; "
                 f"use mode='replace' to overwrite them.",
@@ -106,7 +143,7 @@ class MetadataWriter:
             df = df.drop(collisions)
 
         self._ds.store(art).write(df if existing is None
-                                  else meta_edit.merge_frames(existing, df, key))
+                                  else _merge_frames(existing, df, key))
 
     # --- fetched, rather than supplied ---------------------------------------------------
 
@@ -141,7 +178,7 @@ class MetadataWriter:
         if existing is not None:
             kept = existing.drop([c for c in fetched.columns
                                   if c != "publication_id" and c in existing.columns])
-            fetched = meta_edit.merge_frames(kept, fetched, "publication_id")
+            fetched = _merge_frames(kept, fetched, "publication_id")
 
         self._ds.store(layout.PUBLICATION_EXTRA).write(fetched)
         return fetched
@@ -151,11 +188,12 @@ class MetadataWriter:
     def set_hla(self, df: pl.DataFrame) -> None:
         """Ground-truth HLA typing (keyed on ``patient_id``), joined into ``full_patient_meta``.
 
-        Always a full **replace**: `schema.HLA_META`'s fixed eight columns leave no room for a
-        column-adding merge. Input must already be in canonical notation — bare 4-digit allele
-        strings per locus. Absent loci are filled with null lists (partial typing is allowed),
-        columns outside the schema are warned and dropped, and the write casts to `HLA_META`,
-        so a wrong dtype raises."""
+        Input must be a typed frame with the eight columns of `schema.HLA_META`. The key is 
+        ``patient_id``; the other columns are the HLA loci;
+        ["A", "B", "C", "DRB1", "DPA1", "DPB1", "DQA1", "DQB1"].
+        For each locus, present alleles are stored as a list of 4-digit strings.
+        Example: ["0201", "2401"] for HLA-A, or ["0801"] for homozygous HLA-B. 
+        """
         key, label = "patient_id", "set_hla"
         if key not in df.columns:
             raise ValueError(f"{label}: input is missing the '{key}' key column.")
@@ -184,17 +222,16 @@ class MetadataWriter:
 
         self._ds.store(layout.HLA).write(df)              # the write's select+cast enforces HLA_META
 
-    # --- shared validation ---------------------------------------------------------------
 
     def _validate_keys(self, df: pl.DataFrame, *, key: str, base_keys: List[str],
                        label: str) -> None:
         """Duplicate keys raise — the left join downstream would multiply rows. Keys the dataset
         does not have, and dataset entities the input does not mention, warn: both are usually
         typos, but both are legitimate when metadata arrives in pieces."""
-        if dups := meta_edit.duplicate_keys(df, key):
+        if dups := _duplicate_keys(df, key):
             raise ValueError(f"{label}: duplicate {key} value(s) in input: {_fmt_ids(dups)}.")
 
-        unknown, missing = meta_edit.check_keys(df.get_column(key).to_list(), base_keys)
+        unknown, missing = _check_keys(df.get_column(key).to_list(), base_keys)
         if unknown:
             warnings.warn(
                 f"{label}: {len(unknown)} {key}(s) not present in the dataset "
