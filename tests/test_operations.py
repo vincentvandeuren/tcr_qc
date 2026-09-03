@@ -1,4 +1,4 @@
-"""Operations restructure (phases 0-4): write path, skip, retrieval, rerun, meta isolation."""
+"""Operations: declaration, fan-out, write path, staleness, retrieval, records."""
 import json
 import tempfile
 import warnings
@@ -6,25 +6,28 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
+import pytest
 
-from tcr_io import TcrDataset
+from tcr_io import Dataset
 from tcr_io.structure import (
-    Layout, REQUIRED_DIRS, GENERATED_DIRS, Manifest, operation_relpath,
-    repertoire_locus_relpath, repertoire_meta_relpath,
+    ARTIFACTS, Artifact, Format, Store, Manifest,
+    REPERTOIRE_FILE, REPERTOIRE_META, REPERTOIRE_COUNTS, PATIENT_META, PUBLICATION_IDS,
+    GENERATION_META,
 )
 import tcr_io.structure.schema as S
-from tcr_io.operations import TestNullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ, RarefactionReport
-from tcr_io.operations.base import BaseOperation, OperationResults
+from tcr_io.operations import (
+    NullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ, RarefactionReport,
+)
+from tcr_io.operations.base import BaseOperation
 
 
 def _make_dataset() -> Path:
     d = Path(tempfile.mkdtemp()) / "ds"
-    for sub in REQUIRED_DIRS + GENERATED_DIRS:
-        (d / sub).mkdir(parents=True, exist_ok=True)
+    Store(d).create_tree(ARTIFACTS)
 
     reps = ["rep_a", "rep_b"]
     for rid in reps:
-        f = d / repertoire_locus_relpath(rid, "TRB")   # {id}/locus=TRB/{id}.parquet
+        f = d / REPERTOIRE_FILE.template.format(repertoire_id=rid, locus="TRB")
         f.parent.mkdir(parents=True, exist_ok=True)
         pl.DataFrame({
             "repertoire_id": [rid, rid, rid],
@@ -33,271 +36,328 @@ def _make_dataset() -> Path:
             "junction_aa": ["CASSF", "CASSY", "CASSL"],
             "j_call": ["TRBJ2-1*01", "TRBJ2-1*01", "TRBJ1-1*01"],
             "duplicate_count": [10, 5, 1],
-            "filter_pass": [True, True, False],
-        }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)   # locus is the path, not a column
+            # v6: the reason the row was dropped, null when it passed. `passed <=>
+            # filter_reason.is_null()`, so this is the old `filter_pass` boolean's replacement.
+            "filter_reason": [None, None, "min_duplicate_count"],
+        }).with_columns(
+            clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)
+        ).cast(S.REPERTOIRE).write_parquet(f)   # locus is the path, not a column
 
+    # v6 splits the old single table: what is true of a repertoire regardless of locus, and
+    # what is only true within one. Two writes, two grains.
     pl.DataFrame({
         "repertoire_id": reps, "source_files": [["a"], ["b"]], "patient_id": ["p1", "p1"],
-        "n_clonotypes": [2, 2], "n_filtered_clonotypes": [3, 3], "total_duplicates": [16, 16],
-    }).cast(S.REPERTOIRE_META).write_parquet(d / repertoire_meta_relpath("TRB"))
+    }).cast(S.REPERTOIRE_META).write_parquet(d / REPERTOIRE_META.template)
+    counts = d / REPERTOIRE_COUNTS.template.format(locus="TRB")
+    counts.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "repertoire_id": reps, "n_clonotypes": [2, 2], "n_filtered_clonotypes": [1, 1],
+        "total_duplicates": [16, 16],
+    }).cast(S.REPERTOIRE_COUNTS).write_parquet(counts)
     pl.DataFrame({
         "patient_id": ["p1"], "patient_repertoires": [reps], "n_repertoires": [2],
-    }).cast(S.PATIENT_META).write_parquet(d / Layout.patient_meta.path)
-    pl.DataFrame({"publication_id": []}, schema=S.PUBLICATION_META).write_ndjson(d / Layout.publication_ids.path)
-    pl.DataFrame(
-        {"dataset_name": ["t"], "created_on": [None], "source": ["x"],
-         "reader": ["r"], "repertoire_mapper": ["m"], "patient_mapper": ["m"]}
-    ).cast(S.GENERATION_META).write_ndjson(d / Layout.generation_meta.path)
-    Manifest.current(present_loci=["TRB"]).write(d / Layout.manifest.path)   # _present_loci reads this
+    }).cast(S.PATIENT_META).write_parquet(d / PATIENT_META.template)
+    pl.DataFrame({"publication_id": []}, schema=S.PUBLICATION_META).write_ndjson(
+        d / PUBLICATION_IDS.template)
+    (d / GENERATION_META.template).write_text(json.dumps(
+        {"dataset_name": "t", "created_on": "2026-01-01", "source": "x", "tcrio_version": "t",
+         "reader": "r", "repertoire_mapper": "m", "patient_mapper": "m", "filters": {}}))
+    Manifest.current().write(Store(d))
     return d
 
 
-def _ds() -> TcrDataset:
+@pytest.fixture
+def ds() -> Dataset:
     warnings.simplefilter("ignore")
-    return TcrDataset(_make_dataset())
+    return Dataset(_make_dataset())
 
 
-def test_locus_agnostic_write_and_record():
-    ds = _ds()
-    ds.run_operation(TestNullOperation())
-    rec = json.loads((ds.db_dir / "operations/test_null_operation/operation.json").read_text())
-    assert rec["status"] == "success"
-    assert rec["loci"] is None                                  # locus-agnostic
-    assert rec["outputs"] == [{"name": "filter_pass", "path": "filter_pass.parquet",
-                               "kind": "parquet", "locus": None}]
-    assert (ds.db_dir / "operations/test_null_operation/filter_pass.parquet").exists()
+# --- where a pass writes, and what it records -------------------------------------------
 
-
-def test_locus_aware_writes_under_locus_subdir():
-    ds = _ds()
-    ds.run_operation(DiversityReport())                          # supported_loci = ALL_LOCI
-    rec = json.loads((ds.db_dir / "operations/diversity_report/operation.json").read_text())
-    assert rec["loci"] == ["TRB"]
-    assert rec["outputs"][0]["path"] == "TRB/diversity_summary.parquet"
+def test_locus_aware_writes_under_a_locus_subdir(ds):
+    ds.run_operation(DiversityReport())
+    rec = json.loads(
+        (ds.db_dir / "operations/diversity_report/TRB/operation.json").read_text())
+    assert rec["locus"] == "TRB"
+    # the record sits INSIDE the directory it describes, so output paths are relative to it
+    assert rec["outputs"][0]["template"] == "diversity_summary.parquet"
     assert (ds.db_dir / "operations/diversity_report/TRB/diversity_summary.parquet").exists()
 
 
-def test_retrieval_matches_across_apis():
-    ds = _ds()
+def test_one_record_per_locus(ds):
+    ds.run_operation(NullOperation())
     ds.run_operation(DiversityReport())
-    a = ds.get_operation_result("diversity_report", "diversity_summary", "TRB")
-    b = ds.operation_results.diversity_report.TRB.diversity_summary   # locus-explicit
-    c = ds.operation_results.diversity_report.diversity_summary       # locus omitted
-    assert a.equals(b) and a.equals(c)
+    assert {(r.operation_name, r.locus) for r in ds.operations} == {
+        ("null_operation", "TRB"), ("diversity_report", "TRB")}
 
 
-def test_retrieval_miss_lists_available():
-    ds = _ds()
+# --- retrieval --------------------------------------------------------------------------
+
+def test_result_reads_back_by_artifact(ds):
     ds.run_operation(DiversityReport())
-    try:
-        ds.get_operation_result("diversity_report", "does_not_exist")
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "Available" in str(e)
+    a = ds.result(DiversityReport.diversity_summary, locus="TRB").read()
+    b = ds.select_locus("TRB").result(DiversityReport.diversity_summary).read()   # bound locus
+    assert a.equals(b) and "repertoire_id" in a.columns
 
 
-def test_skip_and_force_rerun():
-    ds = _ds()
+def test_raw_result_reads_back_by_name(ds):
+    ds.run_operation(DiversityReport())
+    by_name = ds.raw_result("diversity_report", "diversity_summary", locus="TRB").read()
+    assert by_name.equals(ds.result(DiversityReport.diversity_summary, locus="TRB").read())
+
+
+def test_raw_result_miss_lists_available(ds):
+    ds.run_operation(DiversityReport())
+    with pytest.raises(ValueError, match="available"):
+        ds.raw_result("diversity_report", "does_not_exist", locus="TRB")
+
+
+# --- staleness --------------------------------------------------------------------------
+
+def test_second_run_is_reused_and_warns(ds):
     ds.run_operation(DiversityReport())
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        ds.run_operation(DiversityReport())                     # already done -> skip
+        ds.run_operation(DiversityReport())
     assert any("already complete" in str(x.message) for x in w)
-    ds.rerun(DiversityReport)                                   # forced reconstruct + run
 
 
-def test_gene_counts_names_and_params():
-    ds = _ds()
-    ds.run_operation(GeneCountsSummary())
-    rec = ds._read_operation_record("gene_counts_summary")
-    assert rec.params == {}
-    assert {o.name for o in rec.outputs} == {"gene_counts", "v_counts", "j_counts", "vj_bias", "vj_long"}
+def test_rerun_forces_a_rebuild(ds):
+    ds.run_operation(DiversityReport())
+    first = ds._record("diversity_report", "TRB").ran_at
+    recs = ds.rerun(DiversityReport)
+    assert [r.status for r in recs] == ["success"]
+    assert ds._record("diversity_report", "TRB").ran_at != first
 
 
-def test_tabulate_unstructured_output():
-    ds = _ds()
-    ds.run_operation(TabulateByVJ())
-    rec = ds._read_operation_record("tabulate_by_vj_gene")
-    o = rec.outputs[0]
-    assert o.kind == "unstructured" and o.path == "TRB/tabulated"
-    tab_dir = ds.get_operation_result("tabulate_by_vj_gene", "tabulated", "TRB")
-    assert isinstance(tab_dir, Path) and tab_dir.is_dir()        # a Path, not a frame
-    lf = pl.scan_parquet(tab_dir, hive_partitioning=True)        # caller reads it itself
-    assert {"v_gene", "j_gene"} <= set(lf.collect_schema().names())
+def test_changed_params_are_not_reused(ds):
+    ds.run_operation(RarefactionReport(num_points=30, max_depth=1000))
+    ds.run_operation(RarefactionReport(num_points=10, max_depth=1000))    # different identity
+    assert ds._record("rarefaction_report", "TRB").params["num_points"] == 10
 
 
-@dataclass
-class _UnstructuredProbe(BaseOperation):
-    name = "unstructured_probe"
-    version = "0.1"
-    description = "writes an unstructured dir (with a subdir) plus a serialised frame"
-    supported_loci = None                                        # locus-agnostic -> locus=None
+def test_a_recordless_directory_is_cleared_before_it_is_reused(ds):
+    """Files with no record are a dead run's leftovers, and they must not be adopted.
 
-    def _run(self, ds, locus=None) -> OperationResults:
-        d = ds._operation_output_dir(self, "bundle", locus)
-        (d / "a.txt").write_text("hello")
-        (d / "sub").mkdir()
-        (d / "sub" / "b.txt").write_text("world")
-        return OperationResults(outputs={"summary": ds.repertoire_meta(locus).select("repertoire_id")})
+    `_run` writes the outputs and the record is written after, so a crash between the two
+    leaves outputs behind with nothing describing them. `_observe` GLOBS, so without a clear
+    the next pass finds those orphans and records them as its own — which is how a
+    parameterised output for a parameter this pass never computed ends up in its record.
 
-
-def test_unstructured_write_record_and_mixed_outputs():
-    ds = _ds()
-    ds.run_operation(_UnstructuredProbe())
-    rec = ds._read_operation_record("unstructured_probe")
-    assert {o.name: o.kind for o in rec.outputs} == {"bundle": "unstructured", "summary": "parquet"}
-    assert next(o.path for o in rec.outputs if o.name == "bundle") == "bundle"
-    bundle = ds.get_operation_result("unstructured_probe", "bundle")
-    assert isinstance(bundle, Path) and (bundle / "a.txt").read_text() == "hello"
-    assert (bundle / "sub" / "b.txt").read_text() == "world"
-    # the frame declared alongside still reads back as a frame
-    assert "repertoire_id" in ds.get_operation_result("unstructured_probe", "summary").columns
-
-
-def test_unstructured_namespace_returns_path():
-    ds = _ds()
-    ds.run_operation(_UnstructuredProbe())
-    p = ds.operation_results.unstructured_probe.bundle
-    assert isinstance(p, Path) and p.is_dir()
-
-
-def test_unstructured_rerun_empties_dir():
-    ds = _ds()
-    ds.run_operation(_UnstructuredProbe())
-    bundle = ds.get_operation_result("unstructured_probe", "bundle")
-    (bundle / "stale.txt").write_text("STALE")
-    ds.rerun(_UnstructuredProbe)                                 # forced re-run
-    assert not (bundle / "stale.txt").exists()                  # empty-on-allocate wiped it
-    assert (bundle / "a.txt").exists()
-
-
-def test_unstructured_one_dir_per_op_raises():
+    This is why the staleness verdict is a boolean and not a three-way: the old `RUN` state
+    meant "no record, so compute without clearing", and that state was this bug.
+    """
     @dataclass
-    class _TwoDirs(BaseOperation):
-        name = "two_dirs"
-        version = "0.1"
-        description = "requests two unstructured dirs -> must fail"
-        supported_loci = None
+    class _Keyed(BaseOperation):
+        name, version, description = "keyed", "0.1", "one table per key"
+        supported_loci = frozenset({"TRB"})
+        table = Artifact("{k}.parquet", Format.PARQUET)
+        keys: tuple = ("a",)
 
-        def _run(self, ds, locus=None) -> OperationResults:
-            ds._operation_output_dir(self, "one", locus)
-            ds._operation_output_dir(self, "two", locus)        # second call for same locus
-            return OperationResults(outputs={})
+        def _run(self, ds, out):
+            for k in self.keys:
+                out(self.table, k=k).write(pl.DataFrame({"x": [1]}))
 
-    ds = _ds()
+    ds.run_operation(_Keyed(keys=("a",)))
+    outdir = ds.db_dir / "operations/keyed/TRB"
+    (outdir / "operation.json").unlink()          # the crash: outputs kept, record lost
+
+    recs = ds.run_operation(_Keyed(keys=("b",)))
+
+    assert {o.template for o in recs[0].outputs} == {"b.parquet"}   # not a.parquet
+    assert not (outdir / "a.parquet").exists()
+
+
+def test_a_failing_locus_records_the_failure(ds):
+    @dataclass
+    class _Boom(BaseOperation):
+        name, version, description = "boom", "0.1", "always raises"
+        supported_loci = frozenset({"TRB"})
+        table = Artifact("table.parquet", Format.PARQUET)
+
+        def _run(self, ds, out):
+            raise RuntimeError("nope")
+
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        ds.run_operation(_TwoDirs())                            # run() catches -> failure record
-    assert any("one per locus" in str(x.message) for x in w)
-    assert ds._read_operation_record("two_dirs").status == "failure"
+        ds.run_operation(_Boom())
+    assert any("failed on locus=TRB" in str(x.message) for x in w)
+    rec = ds._record("boom", "TRB")
+    assert rec.status == "failure" and "nope" in rec.error
 
 
-def test_operation_results_are_real_attributes():
-    # Autocomplete depends on the whole `ds.operation_results.<op>[.<locus>]` chain being REAL
-    # attributes (no @property / __getattr__ intermediates), else IPython's guarded_eval refuses
-    # to traverse it during completion. Guard those structural invariants here.
-    from tcr_io.dataset import OperationResultsNamespace
-    assert "__getattr__" not in vars(OperationResultsNamespace)   # presence blocks guarded_eval
-    ds = _ds()
-    ds.run_operation(DiversityReport())
-    assert "operation_results" in vars(ds)                        # plain attr, not a @property
-    ns = ds.operation_results
-    assert "diversity_report" in vars(ns)                         # op handle is a real attribute
-    assert "TRB" in vars(ns.diversity_report)                     # locus sub-handle is real too
-    # refreshed after a new run so it becomes completable immediately
+# --- output declaration -----------------------------------------------------------------
+
+def test_gene_counts_records_every_declared_output(ds):
     ds.run_operation(GeneCountsSummary())
-    assert "gene_counts_summary" in vars(ds.operation_results)
+    rec = ds._record("gene_counts_summary", "TRB")
+    assert rec.params == {}
+    assert {o.name for o in rec.outputs} == {
+        "gene_counts", "v_counts", "j_counts", "vj_bias", "vj_long"}
 
 
-def test_operation_results_ipython_completion():
-    try:
-        from IPython.terminal.interactiveshell import TerminalInteractiveShell
-        from IPython.core.completer import provisionalcompleter
-    except ImportError:
-        return                                                    # IPython not installed -> skip
-    ds = _ds()
-    ds.run_operation(DiversityReport())
-    ip = TerminalInteractiveShell.instance()
-    ip.user_ns["ds"] = ds
-    ip.Completer.evaluation = "limited"                           # the notebook default policy
+def test_a_declared_output_that_is_never_written_is_an_error(ds):
+    @dataclass
+    class _Forgetful(BaseOperation):
+        name, version, description = "forgetful", "0.1", "declares two, writes one"
+        written = Artifact("written.parquet", Format.PARQUET)
+        forgotten = Artifact("forgotten.parquet", Format.PARQUET)
 
-    def names(text):
-        with provisionalcompleter():
-            return {c.text.split(".")[-1].lstrip(".") for c in ip.Completer.completions(text, len(text))}
+        def _run(self, ds, out):
+            out(self.written).write(ds.repertoire_meta.select("repertoire_id"))
 
-    assert "diversity_report" in names("ds.operation_results.")                     # L1: ops
-    assert {"TRB", "diversity_summary"} <= names("ds.operation_results.diversity_report.")  # L2
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        ds.run_operation(_Forgetful())
+    assert "forgotten" in ds._record("forgetful", "TRB").error
 
 
-def test_rarefaction_report():
-    ds = _ds()
-    ds.run_operation(RarefactionReport(num_points=30, max_depth=1000))
-    rec = ds._read_operation_record("rarefaction_report")
-    assert rec.loci == ["TRB"]
-    assert rec.params == {"num_points": 30, "max_depth": 1000, "extrapolation": True}   # dataclass config
+def test_an_inherited_output_is_refused():
+    # `ds.result()` resolves an output's directory from `owner.name`, so a shared declaration
+    # would file every subclass's results under the base's folder.
+    class _Base(BaseOperation):
+        name, version, description = "shared_base", "0.1", ""
+        shared = Artifact("shared.parquet", Format.PARQUET)
+
+        def _run(self, ds, out):
+            pass
+
+    class _Sub(_Base):
+        name = "shared_sub"
+
+    with pytest.raises(TypeError, match="inherits output"):
+        _Sub.artifacts()
+# --- directory outputs ------------------------------------------------------------------
+
+def test_tabulate_writes_a_scannable_directory(ds):
+    ds.run_operation(TabulateByVJ())
+    rec = ds._record("tabulate_by_vj_gene", "TRB")
     o = rec.outputs[0]
-    assert o.name == "rarefaction_curves" and o.path == "TRB/rarefaction_curves.parquet"
-    df = ds.get_operation_result("rarefaction_report", "rarefaction_curves", "TRB")
+    assert o.name == "tabulated" and o.format == "PARQUET_DIR" and o.template == "tabulated"
+
+    handle = ds.result(TabulateByVJ.tabulated, locus="TRB")
+    assert handle.path().is_dir()
+    names = handle.scan().collect_schema().names()               # no read(); scan only
+    assert {"v_gene", "j_gene"} <= set(names)
+
+
+def test_rerunning_a_directory_output_clears_stale_partitions(ds):
+    ds.run_operation(TabulateByVJ())
+    tab = ds.result(TabulateByVJ.tabulated, locus="TRB").path()
+    (tab / "stale.txt").write_text("STALE")
+    ds.rerun(TabulateByVJ)
+    assert not (tab / "stale.txt").exists()
+    assert any(tab.iterdir())
+
+
+# --- fan-out ----------------------------------------------------------------------------
+
+def test_a_bound_dataset_fans_out_over_its_locus_alone(ds):
+    seen = []
+
+    @dataclass
+    class _Spy(BaseOperation):
+        name, version, description = "spy", "0.1", "records the loci it was run on"
+        supported_loci = frozenset({"TRA", "TRB"})
+        table = Artifact("table.parquet", Format.PARQUET)
+
+        def _run(self, ds, out):
+            seen.append(ds.locus)
+            out(self.table).write(ds.repertoire_meta().select("repertoire_id"))
+
+    ds.select_locus("TRB").run_operation(_Spy())
+    assert seen == ["TRB"]        # TRA is supported but not offered by the binding
+
+
+def test_unsupported_loci_are_skipped(ds):
+    @dataclass
+    class _TraOnly(BaseOperation):
+        name, version, description = "tra_only", "0.1", "supports a locus this dataset lacks"
+        supported_loci = frozenset({"TRA"})
+        table = Artifact("table.parquet", Format.PARQUET)
+
+        def _run(self, ds, out):
+            raise AssertionError("must not run")
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        assert ds.run_operation(_TraOnly()) == []
+    assert any("already complete" in str(x.message) for x in w)
+
+
+# --- a real op end to end ---------------------------------------------------------------
+
+def test_rarefaction_report(ds):
+    ds.run_operation(RarefactionReport(num_points=30, max_depth=1000))
+    rec = ds._record("rarefaction_report", "TRB")
+    assert rec.params == {"num_points": 30, "max_depth": 1000, "extrapolation": True}
+    assert [o.name for o in rec.outputs] == ["rarefaction_curves"]
+    df = ds.result(RarefactionReport.rarefaction_curves, locus="TRB").read()
     assert {"subsampling_depth", "expected_richness", "type", "repertoire_id"} <= set(df.columns)
     assert set(df["repertoire_id"].unique().to_list()) == {"rep_a", "rep_b"}
 
 
-def test_operations_scan():
-    ds = _ds()
-    ds.run_operation(TestNullOperation())
-    ds.run_operation(DiversityReport())
-    assert {r.operation_name for r in ds.operations} == {"test_null_operation", "diversity_report"}
+# --- map_repertoires --------------------------------------------------------------------
 
-
-def test_operation_relpath_locus_segment():
-    assert operation_relpath("op", "out") == "operations/op/out"
-    assert operation_relpath("op", "out", "TRB") == "operations/op/TRB/out"
-
-
-def test_map_repertoires_tags_and_concats():
-    ds = _ds()
-    out = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRB")
+def test_map_repertoires_tags_and_concats(ds):
+    out = ds.select_locus("TRB").map_repertoires(lambda df: df.select(pl.len().alias("n")))
     out = out.collect() if isinstance(out, pl.LazyFrame) else out
-    assert set(out["repertoire_id"].to_list()) == {"rep_a", "rep_b"}   # repertoire_id tagged
+    assert set(out["repertoire_id"].to_list()) == {"rep_a", "rep_b"}
     assert out.height == 2 and "n" in out.columns
 
 
-def test_map_repertoires_concat_false_returns_parts():
-    ds = _ds()
-    parts = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRB", concat=False)
+def test_map_repertoires_concat_false_returns_parts(ds):
+    parts = ds.select_locus("TRB").map_repertoires(
+        lambda df: df.select(pl.len().alias("n")), concat=False)
     assert isinstance(parts, list) and len(parts) == 2
 
 
-def test_filtering_report_unassigned_summary():
+def test_map_repertoires_empty_needs_schema(ds):
+    # Bound straight to a locus with no partitions on disk. `select_locus` would reject "TRA"
+    # (it is not a locus of this dataset); the constructor binds whatever it is given, which is
+    # what makes the empty-repertoire-set path reachable at all.
+    empty_ds = Dataset(ds.db_dir, locus="TRA")
+    sch = pl.Schema({"repertoire_id": pl.Utf8, "n": pl.UInt32})
+    empty = empty_ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), schema=sch)
+    empty = empty.collect() if isinstance(empty, pl.LazyFrame) else empty
+    assert empty.height == 0 and empty.columns == ["repertoire_id", "n"]
+    with pytest.raises(ValueError):
+        empty_ds.map_repertoires(lambda df: df.select(pl.len().alias("n")))
+
+
+# --- filtering report -------------------------------------------------------------------
+
+def test_filtering_report_unassigned_summary(ds):
     from tcr_io.operations.filtering_report import FilteringReport
-    ds = _ds()
     # add an _unassigned partition for rep_a: one null v_call, one null j_call
-    f = ds.db_dir / repertoire_locus_relpath("rep_a", "_unassigned")
+    f = ds.db_dir / REPERTOIRE_FILE.template.format(repertoire_id="rep_a", locus="_unassigned")
     f.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame({
         "repertoire_id": ["rep_a"] * 2, "junction": ["TGA", "TGG"],
         "v_call": [None, "TRBV2*01"], "junction_aa": ["CASSL", "CASSX"],
-        "j_call": ["TRBJ2-1*01", None], "duplicate_count": [1, 1], "filter_pass": [False, False],
-    }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)
+        "j_call": ["TRBJ2-1*01", None], "duplicate_count": [1, 1],
+        "filter_reason": ["null_v", "null_j"],
+    }).with_columns(
+        clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)
+    ).cast(S.REPERTOIRE).write_parquet(f)
 
     ds.run_operation(FilteringReport())
-    # Assignment failures now live under the `_unassigned` pseudo-locus, same shape as a quality
+    # Assignment failures live under the `_unassigned` pseudo-locus, same shape as a quality
     # report: a wide first-failure summary + per-reason top tables + totals.
-    summ = ds.get_operation_result("filtering_report", "filter_summary", "_unassigned")
+    summ = ds.result(FilteringReport.filter_summary, locus="_unassigned").read()
     row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
-    # first-failure attribution over ASSIGNMENT_REASONS: one null_v, one null_j
     assert (row["null_v"], row["null_j"]) == (1, 1)
-    totals = ds.get_operation_result("filtering_report", "filter_reason_totals", "_unassigned")
+    totals = ds.result(FilteringReport.filter_reason_totals, locus="_unassigned").read()
     t = dict(zip(totals["reason"].to_list(), totals["n_failed_rows"].to_list()))
     assert t["null_v"] == 1 and t["null_j"] == 1
 
 
-def test_filtering_report_quality_population():
+def test_filtering_report_quality_population(ds):
     from tcr_io.operations.filtering_report import FilteringReport
-    ds = _ds()
-    # Overwrite rep_a's TRB partition with rows whose failure reasons are known. The report
-    # recomputes WHY from the data (filter_pass just marks a row as failed).
-    f = ds.db_dir / repertoire_locus_relpath("rep_a", "TRB")
+    # Overwrite rep_a's TRB partition with rows whose failure reasons are known. Since v0.6
+    # the report READS `filter_reason` rather than rebuilding it, so the fixture states the
+    # reason ingestion would have written — including the first-failure attribution below.
+    f = ds.db_dir / REPERTOIRE_FILE.template.format(repertoire_id="rep_a", locus="TRB")
     pl.DataFrame({
         "repertoire_id": ["rep_a"] * 4,
         "junction":      ["TGTGCC", "TGTGCC",   "TGTGCC",      None],
@@ -305,32 +365,37 @@ def test_filtering_report_quality_population():
         "junction_aa":   ["CASSLGYEQYF", "XXX",   "CASSLGYEQYF", "XXX"],
         "j_call":        ["TRBJ2-1*01"] * 4,
         "duplicate_count": [10, 1, 1, 1],
-        # row0 passes; rows 1-3 fail (reasons: valid_junction_aa, invalid_v_call, null_junction)
-        "filter_pass":   [True, False, False, False],
-    }).with_columns(clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)).cast(S.REPERTOIRE).write_parquet(f)
+        # row0 passes (null reason); rows 1-3 carry the first filter that rejected them. The
+        # last row is null junction + "XXX" junction_aa: ingest attributes it to null_junction,
+        # which comes first in the default set, NOT to invalid_junction_aa.
+        "filter_reason": [None, "invalid_junction_aa", "invalid_v_call", "null_junction"],
+    }).with_columns(
+        clonotype_id=pl.int_range(pl.len(), dtype=pl.UInt32)
+    ).cast(S.REPERTOIRE).write_parquet(f)
 
     ds.run_operation(FilteringReport())
 
-    # Outputs are now per-locus under operations/filtering_report/TRB/.
-    summ = ds.get_operation_result("filtering_report", "filter_summary", "TRB")
+    summ = ds.result(FilteringReport.filter_summary, locus="TRB").read()
     row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
-    # first-failure attribution: the (null junction + "XXX") row counts as null_junction, NOT
-    # invalid_junction_aa (null_junction comes first in the default set). Failure reason for a bad
-    # junction_aa is "invalid_junction_aa" (not the pass-condition name "valid_junction_aa").
     assert row["invalid_junction_aa"] == 1
     assert row["invalid_v_call"] == 1
     assert row["null_junction"] == 1
 
-    top_aa = ds.get_operation_result("filtering_report", "filter_top_invalid_junction_aa", "TRB")
+    top_aa = ds.result(FilteringReport.filter_top, locus="TRB",
+                       reason="invalid_junction_aa").read()
     assert top_aa.filter(pl.col("junction_aa") == "XXX")["count"].to_list() == [1]
-    top_v = ds.get_operation_result("filtering_report", "filter_top_invalid_v_call", "TRB")
+    top_v = ds.result(FilteringReport.filter_top, locus="TRB", reason="invalid_v_call").read()
     assert top_v.filter(pl.col("v_call") == "TRBV999*01")["count"].to_list() == [1]
 
-    # an empty top table is still emitted for a quality reason that never fired
-    empty = ds.get_operation_result("filtering_report", "filter_top_invalid_j_call", "TRB")
-    assert empty.height == 0 and empty.columns == ["j_call", "count"]
+    # A reason that never fired gets NO table. v0.5 emitted an empty one, because it rebuilt
+    # the report from the filter set and so knew every reason that could have fired; v0.6 reads
+    # the stored `filter_reason`, which only names the ones that did. The runner allows it —
+    # `_observe` exempts parameterised artifacts, since "no filter reason fired" is a
+    # legitimate zero — and the legend below still says which reasons the locus saw.
+    assert not ds.result(FilteringReport.filter_top, locus="TRB",
+                         reason="invalid_j_call").exists()
 
-    legend = ds.get_operation_result("filtering_report", "filter_legend", "TRB")
+    legend = ds.result(FilteringReport.filter_legend, locus="TRB").read()
     assert {"reason", "description", "group_col"} <= set(legend.columns)
     assert "imgt_functional" not in legend["reason"].to_list()   # expanded into sub-reasons
     assert "invalid_v_call" in legend["reason"].to_list()
@@ -338,23 +403,3 @@ def test_filtering_report_quality_population():
     # assignment reasons (null_v/null_j) are NOT in a real locus's quality legend — they are
     # reported only on the _unassigned partition (population separation).
     assert "null_v" not in legend["reason"].to_list()
-
-
-def test_map_repertoires_empty_needs_schema():
-    ds = _ds()
-    sch = pl.Schema({"repertoire_id": pl.Utf8, "n": pl.UInt32})
-    empty = ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRA", schema=sch)  # no TRA reps
-    empty = empty.collect() if isinstance(empty, pl.LazyFrame) else empty
-    assert empty.height == 0 and empty.columns == ["repertoire_id", "n"]
-    try:
-        ds.map_repertoires(lambda df: df.select(pl.len().alias("n")), locus="TRA")   # empty, no schema -> raise
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-
-
-if __name__ == "__main__":
-    for _name, _fn in sorted(globals().items()):
-        if _name.startswith("test_") and callable(_fn):
-            _fn()
-            print("ok:", _name)

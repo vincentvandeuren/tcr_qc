@@ -58,22 +58,25 @@ def test_imgt_sub_reports():
 
 def test_filterset_golden_snapshot():
     """FilterSet.pass_expr on the fixture must match the snapshot captured from the legacy
-    Filterer (byte-identical, verified during the refactor). Guards against silent drift."""
+    Filterer (byte-identical, verified during the refactor). Guards against silent drift.
+
+    `pass_expr()` is unaliased — it is a bare boolean, and the caller names it — so the alias
+    is the test's job. The second assertion pins the invariant the v6 schema rests on:
+    `passed <=> filter_reason.is_null()`. They are two expressions and could drift apart."""
     expected = [True, False, False, False, False, False]
-    new = _FIXTURE.select(FilterSet.named("default_trb").pass_expr())["filter_pass"]
-    assert new.to_list() == expected
-
-
-def test_from_names_roundtrip():
-    names = FilterSet.named("default_trb").names
-    assert FilterSet.from_names(names).names == names
+    fs = FilterSet.named("default_trb")
+    assert _FIXTURE.select(fs.pass_expr().alias("filter_pass"))["filter_pass"].to_list() == expected
+    assert _FIXTURE.select(fs.reason_expr())["filter_reason"].is_null().to_list() == expected
 
 
 def test_named_and_available():
+    """`named()` is the whole reconstruction path — a preset name is what re-runs an ingest,
+    and `available()` is how you find one. There is no rebuild-from-filter-names any more."""
     assert "default_trb" in FilterSet.available()
     assert FilterSet.named("default_trb")._preset_name == "default_trb"
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="available"):
         FilterSet.named("does_not_exist")
+    assert not hasattr(FilterSet, "from_names")
 
 
 def test_reasons_flattened_and_ordered():
@@ -90,10 +93,13 @@ def test_per_locus_filter_set_assigns_locus_and_forces_unassigned():
     pl_fs = PerLocusFilterSet.uniform(FilterSet.named("default_trb"))
     out = pl_fs.run(_FIXTURE.lazy()).collect()
     assert "locus" in out.columns
-    assert "filter_pass" in out.columns
-    # null v_call (row 1) -> _unassigned partition -> forced False
+    assert "filter_reason" in out.columns          # v6: the reason, not a boolean
+    # Rows that could not be placed land in `_unassigned` and carry the ASSIGNMENT reason they
+    # failed on — not a quality reason they were never tested against. That distinction is the
+    # reason those rows are kept at all.
     row = out.filter(pl.col("locus") == UNASSIGNED)
-    assert row["filter_pass"].to_list() == [False] * row.height
+    assert row["filter_reason"].to_list() == ["null_v", "null_j"]
+    assert row["filter_reason"].is_null().sum() == 0        # every one is excluded
 
 
 def test_per_locus_explicit_mapping():
@@ -117,7 +123,10 @@ def test_per_locus_unlisted_chain_fails():
         "junction_aa": ["CASSLGYEQYF", "CASSLGYEQYF"],
     })
     out = pl_fs.run(df.lazy()).collect().sort("locus")
-    assert dict(zip(out["locus"], out["filter_pass"])) == {"TRA": False, "TRB": True}
+    # A locus nobody supplied a filter set for is excluded wholesale, and says so rather than
+    # borrowing a quality reason. TRB passes, so its reason is null.
+    assert dict(zip(out["locus"], out["filter_reason"])) == {"TRA": "locus_not_accepted",
+                                                            "TRB": None}
 
 
 def test_per_locus_duplicate_locus_raises():

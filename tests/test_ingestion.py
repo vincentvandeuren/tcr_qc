@@ -10,16 +10,16 @@ from tcr_io.readers import AirrReader
 from tcr_io.mappers import FileNameMapper, DictMapper
 from tcr_io.expressions import assign_locus, extract_locus, UNASSIGNED
 from tcr_io.filters import FilterSet, PerLocusFilterSet, NullVFilter, NullJFilter
-from tcr_io.structure import Layout, Manifest
+from tcr_io.structure import DATASET_VERSION, Manifest, Store, OPERATIONS_DIR, PROCESSED_DIR, MANIFEST
 
 
 def _seed_db() -> Path:
     """A minimal existing dataset with a processed repertoire and one operation result."""
     root = Path(tempfile.mkdtemp())
     db = root / "ds"
-    (db / Layout.processed_dir.path).mkdir(parents=True)
-    (db / Layout.processed_dir.path / "rep_a.parquet").write_text("x")
-    opdir = db / Layout.operations_dir.path / "diversity_report"
+    (db / PROCESSED_DIR.template).mkdir(parents=True)
+    (db / PROCESSED_DIR.template / "rep_a.parquet").write_text("x")
+    opdir = db / OPERATIONS_DIR / "diversity_report"
     (opdir / "TRB").mkdir(parents=True)
     (opdir / "operation.json").write_text(json.dumps({"status": "success"}))
     (opdir / "TRB" / "diversity_summary.parquet").write_text("y")
@@ -33,18 +33,18 @@ def test_reingest_clears_stale_operation_outputs():
     root = _seed_db()
     ing = DatasetIngester(db_dir=root, db_name="ds", repertoire_mapper=None, patient_mapper=None)
     ing._delete_existing_data()
-    assert not (ing.db_dir / Layout.processed_dir.path).exists()
-    assert not (ing.db_dir / Layout.operations_dir.path).exists()
+    assert not (ing.db_dir / PROCESSED_DIR.template).exists()
+    assert not (ing.db_dir / OPERATIONS_DIR).exists()
 
 
 def test_delete_existing_data_ok_without_operations_dir():
     # Older datasets may have no operations/ yet — clearing must not raise.
     root = _seed_db()
     import shutil
-    shutil.rmtree(root / "ds" / Layout.operations_dir.path)
+    shutil.rmtree(root / "ds" / OPERATIONS_DIR)
     ing = DatasetIngester(db_dir=root, db_name="ds", repertoire_mapper=None, patient_mapper=None)
     ing._delete_existing_data()          # must not raise
-    assert not (ing.db_dir / Layout.processed_dir.path).exists()
+    assert not (ing.db_dir / PROCESSED_DIR.template).exists()
 
 
 def _mixed_locus_frame() -> pl.DataFrame:
@@ -72,8 +72,9 @@ def test_extract_locus_trav_dv_disambiguated_by_j():
 
 
 def test_filter_applied_after_locus_assignment():
-    """Phase 2: quality filters run after assign_locus. Assigned-locus rows get real filter_pass;
-    _unassigned rows (null/mismatch/unknown-locus) are forced to fail."""
+    """Phase 2: quality filters run after assign_locus. Assigned-locus rows get the reason
+    their own filter set gave them; _unassigned rows (null/mismatch/unknown-locus) carry the
+    ASSIGNMENT reason instead — they were never tested against a quality filter."""
     d = Path(tempfile.mkdtemp())
     src = d / "data"; src.mkdir()
     pl.DataFrame({
@@ -92,21 +93,27 @@ def test_filter_applied_after_locus_assignment():
         reader=AirrReader(),
     ).run(src)
 
-    assert sorted(ds._present_loci()) == ["TRB"]
+    assert sorted(ds.present_loci) == ["TRB"]
 
-    base = d / "db" / "processed_repertoires" / "sampleA.tsv"
+    # v6 is locus-first: `locus={L}/{id}.parquet`, not `{id}/locus={L}/{id}.parquet`
+    base = d / "db" / "processed_repertoires"
     trb = pl.read_parquet(base / "locus=TRB" / "sampleA.tsv.parquet")
-    # the fully valid clonotype passes; the invalid-gene one fails
-    assert trb.filter(pl.col("v_call") == "TRBV2*01")["filter_pass"].to_list() == [True]
-    assert trb.filter(pl.col("v_call") == "TRBV999*01")["filter_pass"].to_list() == [False]
+    # null reason == passed. The invalid-gene row names the filter that rejected it, which the
+    # old boolean could not: `filter_reason` is what made the filtering report a group-by.
+    assert trb.filter(pl.col("v_call") == "TRBV2*01")["filter_reason"].to_list() == [None]
+    assert trb.filter(pl.col("v_call") == "TRBV999*01")["filter_reason"].to_list() == ["invalid_v_call"]
 
     una = pl.read_parquet(base / "locus=_unassigned" / "sampleA.tsv.parquet")
     assert una.height == 2                                   # TRB/TRA mismatch + null v_call
-    assert una["filter_pass"].to_list() == [False, False]   # _unassigned always fails
+    assert una["filter_reason"].is_null().sum() == 0         # _unassigned is always excluded
+    assert set(una["filter_reason"]) == {"incompatible_locus", "null_v"}
 
 
 def test_ingest_records_filter_provenance():
-    """Phase 3: the filter set(s) used at ingest are recorded in the manifest."""
+    """The filter set(s) used at ingest are recorded in the ingest record.
+
+    Ingestion cleans in place and `filter_reason` names only the filters that FIRED, so this
+    is the only record of what was applied."""
     d = Path(tempfile.mkdtemp())
     src = d / "data"; src.mkdir()
     pl.DataFrame({
@@ -125,13 +132,15 @@ def test_ingest_records_filter_provenance():
         filter_set=PerLocusFilterSet({("TRB",): override, ("TRA",): FilterSet.named("default_trb")}),
     ).run(src)
 
-    m = Manifest.read(d / "db" / Layout.manifest.path)
-    assert m.filters["TRB"]["filters"] == ["null_v", "null_j"]
-    assert m.filters["TRA"]["preset"] == "default_trb"
-    assert "imgt_functional" in m.filters["TRA"]["filters"]
-    assert "*" not in m.filters                     # no catch-all default anymore
-    # reconstructable from provenance
-    assert FilterSet.from_names(m.filters["TRB"]["filters"]).names == ["null_v", "null_j"]
+    filters = ds.generation_meta["filters"]
+    assert filters["TRB"]["filters"] == ["null_v", "null_j"]
+    assert filters["TRA"]["preset"] == "default_trb"
+    assert "imgt_functional" in filters["TRA"]["filters"]
+    assert "*" not in filters                       # no catch-all default anymore
+    # A preset name re-runs; an ad-hoc set has none, and its expansion is all there is.
+    assert filters["TRB"]["preset"] is None
+    assert FilterSet.named(filters["TRA"]["preset"]).names == filters["TRA"]["filters"]
+    assert Manifest.read(Store(d / "db")).version == DATASET_VERSION   # manifest holds only this
 
 
 if __name__ == "__main__":
