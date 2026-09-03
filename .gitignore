@@ -15,3 +15,7 @@ venv
 # Generated outputs live in tcr_io/resources/ and ARE tracked.
 /model_sources/*
 !/model_sources/README.md
+
+# AI generated temporary files
+.docs/*
+.claude/*
