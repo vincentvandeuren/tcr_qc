@@ -1,7 +1,7 @@
 import polars as pl
 from typing import Dict, List, Literal, Optional, Union
 
-from ._rust_expressions import _map_gene_alias, _trim_nucleotide_to_cdr3, _is_functional_tcr, _determine_reference_points
+from ._rust_expressions import _map_gene_alias, _trim_nucleotide_to_cdr3, _is_functional_tcr, _determine_reference_points, _translate
 
 # The receptor loci tcrio understands. Phase 1 ships the TR chains; the IG chains are
 # recognised here so BCR data (Phase 2) partitions correctly the moment the reference
@@ -25,6 +25,17 @@ def trim_junction_to_cdr3(
         junction_aa= pl.col("junction_aa"),
         ) -> pl.Expr:
     return _trim_nucleotide_to_cdr3(junction, junction_aa)
+
+def translate(
+        junction= pl.col("junction"),
+        ) -> pl.Expr:
+    """Translate a nucleotide column to amino acids in frame 0.
+
+    The output keeps the input column's name, so alias it at the call site
+    (e.g. ``translate().alias("junction_aa")``). Incomplete trailing codons are
+    dropped, non-ACGT codons become "X" and stop codons become "*".
+    """
+    return _translate(junction)
 
 def to_imgt(
         gene_col = pl.col("v_call"), 

@@ -4,7 +4,7 @@ use pyo3_polars::derive::polars_expr;
 use serde::Deserialize;
 use crate::genes_imgt::{Organism, DEFAULT_ALLELE, GENE_ALIASES, IMGT_REF};
 use crate::reference_points::{determine_reference_points};
-use crate::junction_trimmer::trim_junction_to_cdr3;
+use crate::junction_trimmer::{translate_into, trim_junction_to_cdr3};
 
 /// Declare the Struct dtype for ReferencePoints
 fn reference_points_struct_output(_input_fields: &[Field]) -> PolarsResult<Field> {
@@ -138,6 +138,14 @@ pub fn trim_junction_to_cdr3_polars(inputs: &[Series]) -> PolarsResult<Series> {
         .collect();
 
     Ok(out.into_series())
+}
+
+
+#[polars_expr(output_type=String)]
+pub fn translate_polars(inputs: &[Series]) -> PolarsResult<Series> {
+    let ca: &StringChunked = inputs[0].str()?;
+    let out = ca.apply_into_string_amortized(|v, buf| translate_into(v.as_bytes(), buf));
+    Ok(out.with_name(ca.name().clone()).into_series())
 }
 
 

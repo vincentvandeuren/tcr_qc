@@ -54,6 +54,21 @@ def _trim_nucleotide_to_cdr3(junction:pl.Expr, junction_aa:pl.Expr) -> pl.Expr:
         is_elementwise=True,
     )
 
+def _translate(seq:pl.Expr) -> pl.Expr:
+    """
+    Translates a nucleotide sequence to amino acids, reading in frame 0.
+    Input is case-insensitive; the output is uppercase and keeps the input column's name.
+    A trailing 1-2 nucleotide remainder is dropped, so the output is len(seq) // 3 residues.
+    Any codon containing a character other than ACGT (e.g. N) becomes "X"; stop codons become "*".
+    Null in, null out.
+    """
+    return register_plugin_function(
+        args=[seq],
+        plugin_path=LIB,
+        function_name="translate_polars",
+        is_elementwise=True,
+    )
+
 def _map_gene_alias(gene:pl.Expr, split_on_character: str) -> pl.Expr:
     """
     Maps a gene name to its canonical name based on the GENE_ALIASES mapping.

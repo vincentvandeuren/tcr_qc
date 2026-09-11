@@ -20,10 +20,13 @@ fn translate_codon(a: u8, b: u8, c: u8) -> Option<u8> {
     Some(CODON_AA[(i << 4) | (j << 2) | k])
 }
 
-fn translate(seq: &[u8]) -> String {
-    seq.chunks_exact(3)
-        .map(|c| translate_codon(c[0], c[1], c[2]).unwrap_or(b'X') as char)
-        .collect()
+/// Translate `seq` in frame 0, appending the residues to `buf`. A trailing 1-2 nt remainder is
+/// dropped; a codon containing anything but ACGT/acgt becomes `X`; stop codons become `*`.
+pub fn translate_into(seq: &[u8], buf: &mut String) {
+    buf.extend(
+        seq.chunks_exact(3)
+            .map(|c| translate_codon(c[0], c[1], c[2]).unwrap_or(b'X') as char),
+    );
 }
 
 fn trim_nt<'a>(nt: &'a [u8], aa: &[u8]) -> Option<&'a [u8]> {
