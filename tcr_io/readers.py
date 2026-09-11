@@ -1,9 +1,9 @@
 import polars as pl
-from abc import ABC, abstractmethod
+from abc import ABC
 from pathlib import Path
 from typing import Tuple, List, Dict, ClassVar, Optional, Iterable, Literal
 import gzip
-from .expressions import to_imgt, trim_junction_to_cdr3, is_functional_tcr
+from .expressions import to_imgt, trim_junction_to_cdr3, translate
 from .grouper import Grouper
 import csv
 
@@ -353,6 +353,24 @@ class KoshlanTcrdistReader(AirrReader):
         "j_b_gene":"j_call",
         "templates":"duplicate_count"
     }
+
+class ChangeoReader(BaseReader):
+    name = "changeo"
+    col_map = {
+        "JUNCTION": "junction",
+        "V_CALL": "v_call",
+        "J_CALL": "j_call",
+        ("UMICOUNT", "DUPCOUNT"): "duplicate_count"
+    }
+
+    def _process(self, df):
+        
+        df = df.with_columns(
+            pl.col("v_call").str.extract(r"^([^,]+)", 1), # take first call if multiple (comma-separated)
+            pl.col("j_call").str.extract(r"^([^,]+)", 1),
+            translate(pl.col("junction")).alias("junction_aa")
+        )
+        return super()._process(df)
 
 immunarch_gene_map = {
     'TRBV13-1': 'TRBV13',
