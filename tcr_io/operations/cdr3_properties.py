@@ -12,7 +12,7 @@ import polars as pl
 class CDR3_properties(BaseOperation):
     name = "cdr3_properties"
     version = "0.2"
-    description = "Counts the number of CMV ecocluster hits for each repertoire."
+    description = "Computes the average amino acid properties for the CDR3 sequences in each repertoire. The average is computed both unweighted (`cdr3_properties`) and weighted by the duplicate count of each clonotype (`duplicate_weighted_cdr3_properties`)."
 
     cdr3_properties = Artifact("cdr3_properties.parquet", Format.PARQUET)
     duplicate_weighted_cdr3_properties = Artifact("duplicate_weighted_cdr3_properties.parquet", Format.PARQUET)
