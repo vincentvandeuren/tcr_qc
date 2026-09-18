@@ -11,10 +11,11 @@ import polars as pl
 @dataclass
 class CDR3_properties(BaseOperation):
     name = "cdr3_properties"
-    version = "0.1"
+    version = "0.2"
     description = "Counts the number of CMV ecocluster hits for each repertoire."
 
     cdr3_properties = Artifact("cdr3_properties.parquet", Format.PARQUET)
+    duplicate_weighted_cdr3_properties = Artifact("duplicate_weighted_cdr3_properties.parquet", Format.PARQUET)
 
     model_checkpoint: Optional[str] = None
 
@@ -26,13 +27,20 @@ class CDR3_properties(BaseOperation):
     def _run(self, ds, out: Store) -> None:
 
         def compute_features(df):
-            # repertoire_id is tagged by map_repertoires; per-rep aggregate is one row.
+
             counts = df.select(
-                pl.col("junction_aa").str.split("", literal=True).explode(empty_as_null=False).alias("aa")
-            ).group_by("aa").agg(pl.len().alias("aa_count"))
+                pl.col("junction_aa").str.split("", literal=True).alias("aa"),
+                pl.col("duplicate_count")
+            ).explode("aa", empty_as_null=False).group_by("aa").agg(
+                pl.len().alias("aa_count"), pl.sum("duplicate_count").alias("weighted_count")
+            )
+
+            fts  = [(pl.col("aa_count").dot(f) / pl.col("aa_count").sum()).alias(f) for f in self.feature_cols] 
+            wt_fts = [(pl.col("weighted_count").dot(f) / pl.col("weighted_count").sum()).alias(f+"_weighted") for f in self.feature_cols]
+            all_fts = fts + wt_fts
 
             feature_avgs = counts.join(self.aa_features, on="aa", how="left").select(
-                *[(pl.col("aa_count").dot(f) / pl.col("aa_count").sum()).alias(f) for f in self.feature_cols]
+                *all_fts
             )
 
             return feature_avgs
@@ -44,5 +52,8 @@ class CDR3_properties(BaseOperation):
         )   # eager: per-rep collect inside the helper
 
         feature_avgs_all = ds.repertoire_counts.select(["repertoire_id", "n_clonotypes"]).join(feature_avgs_all, on="repertoire_id", how="left")
+        cdr3_properties = feature_avgs_all.select(["repertoire_id", "n_clonotypes"] + self.feature_cols)
+        duplicate_weighted_cdr3_properties = feature_avgs_all.select(["repertoire_id", "n_clonotypes"] + [f+"_weighted" for f in self.feature_cols])
 
-        out(self.cdr3_properties).write(feature_avgs_all)
+        out(self.cdr3_properties).write(cdr3_properties)
+        out(self.duplicate_weighted_cdr3_properties).write(duplicate_weighted_cdr3_properties)
