@@ -104,25 +104,3 @@ class BaseOperation(ABC):
         `supported_loci` there is no longer a reason to want one.
         """
         return sorted(self.supported_loci & offered)
-
-
-@dataclass
-class NullOperation(BaseOperation):
-    """The smallest complete operation: one table, no config.
-
-    Lives here rather than in the tests because it is the worked example of the contract —
-    declare an Artifact, write through `out`, return nothing.
-    """
-    name = "null_operation"
-    version = "0.2"
-    description = "Per-repertoire fraction of clonotypes that passed ingest filtering."
-
-    pass_rate = Artifact("pass_rate.parquet", Format.PARQUET)
-
-    def _run(self, ds: "Dataset", out: Store) -> None:
-        out(self.pass_rate).write(
-            ds.repertoire_counts
-            .with_columns(pass_pct=pl.col("n_clonotypes")
-                          / pl.col("n_clonotypes").add(pl.col("n_filtered_clonotypes")))
-            .select(["repertoire_id", "pass_pct"])
-        )
