@@ -22,5 +22,5 @@ class TabulateByVJ(BaseOperation):
 
     def _run(self, ds, out: Store) -> None:
         lf = ds.clonotypes.with_columns(*extract_genes()).select(["v_gene", "j_gene", "junction_aa", "repertoire_id"])
-        res = lf.sink_parquet(pl.PartitionBy(out(self.tabulated), key=["v_gene", "j_gene"], include_key=False), lazy=True)
+        res = lf.sink_parquet(pl.PartitionBy(out(self.tabulated).clear(), key=["v_gene", "j_gene"], include_key=False), lazy=True)
         res.collect(engine="streaming")
