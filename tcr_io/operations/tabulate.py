@@ -8,18 +8,19 @@ import polars as pl
 @dataclass
 class TabulateByVJ(BaseOperation):
     name = "tabulate_by_vj_gene"
-    version = "0.2"
+    version = "0.3"
     description = "Tabulates the repertoire by V and J gene for all passing rows into a hive-partitioned (v_gene, j_gene) directory."
     supported_loci = KNOWN_LOCI
 
     # A directory, not a file: polars sinks the hive partitions into it and it is read back
     # with `scan()`, never `read()` — PARQUET_DIR has no reader, so that is enforced rather
     # than documented.
+    # v0.3: include_key=False, so the partition columns are not duplicated in the parquet files.
+    # also selected only the columns needed for the tabulation, to reduce the size of the output files.
+    
     tabulated = Artifact("tabulated", Format.PARQUET_DIR)
 
     def _run(self, ds, out: Store) -> None:
-        # `ds` is locus-bound by the runner, so `clonotypes` is this locus's passing rows.
-        lf = ds.clonotypes.with_columns(*extract_genes())
-        # clear() before the sink: a partition left behind by a previous run would otherwise
-        # be scanned back as if this run had produced it.
-        lf.sink_parquet(pl.PartitionBy(out(self.tabulated).clear(), key=["v_gene", "j_gene"]))
+        lf = ds.clonotypes.with_columns(*extract_genes()).select(["v_gene", "j_gene", "junction_aa", "repertoire_id"])
+        res = lf.sink_parquet(pl.PartitionBy(out(self.tabulated), key=["v_gene", "j_gene"], include_key=False), lazy=True)
+        res.collect(engine="streaming")
