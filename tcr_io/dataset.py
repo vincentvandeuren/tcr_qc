@@ -12,9 +12,6 @@ from .operations.base import BaseOperation
 from .operations.record import OPERATION_RECORD, OperationRecord
 from .operations.runner import OperationRunner
 from .grouper import Grouper
-# `layout` whole, the machinery by name. This module reads most of the layout — one accessor
-# per artifact — so listing each would mean editing this block to add an accessor, and
-# `layout.X` says at the call site that X is a declared path rather than a local.
 from .structure import (
     layout, Artifact, Handle, Store, Manifest, Migrator, DATASET_VERSION, required_dirs,
 )
