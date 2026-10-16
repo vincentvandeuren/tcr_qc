@@ -125,10 +125,16 @@ class ValidJunctionAaFilter(BaseFilter):
     name = "valid_junction_aa"          # registry/provenance key (pass-condition, matches legacy)
     reason_name = "invalid_junction_aa"  # failure label for the report
     group_col = "junction_aa"
-    description = ("Amino-acid junction is malformed: wrong length, a non-amino-acid character, "
-                  "or a non-canonical start/end residue.") # @claude can you make this less concise and more explicit / exact?
+    description = "Junction_aa: wrong length, a non-amino-acid character, or a non-canonical start/end residue."
     def pass_expr(self) -> pl.Expr:
         return is_valid_junction_aa()
+
+class ZeroDuplicateCountFilter(BaseFilter):
+    name = "zero_duplicate_count"
+    group_col = "duplicate_count"
+    description = "Duplicate count is zero."
+    def pass_expr(self) -> pl.Expr:
+        return pl.col("duplicate_count") > 0
 
 
 class ImgtFunctionalFilter(StructFilter):
@@ -398,6 +404,7 @@ def _default_trb() -> FilterSet:
         NullJunctionFilter(),
         NullJunctionAAFilter(),
         ValidJunctionAaFilter(),
+        ZeroDuplicateCountFilter(),
         ImgtFunctionalFilter(),
     ])
 
@@ -408,5 +415,6 @@ def _no_junction_nt_trb() -> FilterSet:
         NullJFilter(),
         NullJunctionAAFilter(),
         ValidJunctionAaFilter(),
+        ZeroDuplicateCountFilter(),
         ImgtFunctionalFilter(),
     ])
