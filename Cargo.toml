@@ -16,3 +16,5 @@ polars-arrow = { version = "0.53.0", default-features = false }
 num-traits = "0.2.19"
 aho-corasick = "1.1.4"
 rayon = "1"
+# Symmetric-deletion similarity search; core crate is pyo3-free and shares our rayon pool.
+symscan = "0.8"
