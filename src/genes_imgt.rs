@@ -164,25 +164,24 @@ pub static DEFAULT_ALLELE: LazyLock<HashMap<String, String>> = LazyLock::new(|| 
 // load-bearing: the reference also contains TRD D-genes (TRDD1/2/3), and without it the "TRBD"
 // index pools TRBD + TRDD, so TRB junctions get matched against TRD D-segments — a wrong
 // annotation. `determine_reference_points` only computes D for TRB, so this index is TRB-only.
-pub static IMGT_HUMAN_TRBD: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    IMGT_REF
-        .get(&Organism::Human)
+// Entries are (allele name, sequence), sorted by name: the D index refers to alleles by position.
+fn trb_d_alleles(organism: Organism) -> Vec<(&'static str, &'static str)> {
+    let mut alleles: Vec<(&'static str, &'static str)> = IMGT_REF
+        .get(&organism)
         .into_iter()
         .flat_map(|m| m.values())
         .filter(|t| t.gene_type == TcrGeneType::D && t.chain == TcrChain::TRB)
-        .map(|t| t.sequence_nt.as_str())
-        .collect()
-});
+        .map(|t| (t.id.1.as_str(), t.sequence_nt.as_str()))
+        .collect();
+    alleles.sort_unstable();
+    alleles
+}
 
-pub static IMGT_MOUSE_TRBD: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    IMGT_REF
-        .get(&Organism::Mouse)
-        .into_iter()
-        .flat_map(|m| m.values())
-        .filter(|t| t.gene_type == TcrGeneType::D && t.chain == TcrChain::TRB)
-        .map(|t| t.sequence_nt.as_str())
-        .collect()
-});
+pub static IMGT_HUMAN_TRBD: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(|| trb_d_alleles(Organism::Human));
+
+pub static IMGT_MOUSE_TRBD: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(|| trb_d_alleles(Organism::Mouse));
 
 
 fn parse_aliases() -> impl Iterator<Item = (String, String)> {

@@ -18,19 +18,21 @@ LIB = Path(__file__).parent
 
 def _determine_reference_points(junction: pl.Expr, v_call: pl.Expr, j_call: pl.Expr, organism:str="human") -> pl.Expr:
     """
-    Determines the reference points in a sequence:
-    struct ReferencePoints {
-    - v_end_trimmed: usize,
-    - d_begin_trimmed: usize,
-    - d_end_trimmed: usize,
-    - j_begin_trimmed: usize,
-    - v_end: usize,
-    - d_begin: usize,
-    - d_end: usize,
-    - j_begin: usize,
-    - cdr3_end: usize,
+    Determines the reference points in a junction (lowercase nucleotides). Struct fields:
+    - v_end_trimmed: UInt32, end of V in the junction, P-nucleotides included
+    - d_begin_trimmed: UInt32, start of D in the junction, P included; null without D
+    - d_end_trimmed: UInt32, end of D in the junction, P included; null without D
+    - j_begin_trimmed: UInt32, start of J in the junction, P included
+    - v_end: Int32, where the untrimmed germline V would end
+    - d_begin: Int32, where the untrimmed germline D would start; null without D
+    - d_end: Int32, where the untrimmed germline D would end; null without D
+    - j_begin: Int32, where the untrimmed germline J would start (negative before the junction)
+    - cdr3_end: UInt32, junction length
+    - d_call: String, AIRR-style D call (alleles sorted, comma-separated); null without D
+    Germline minus trimmed differences are deletions when positive and P-nucleotides when
+    negative. D is only searched for TRB. All fields are null when a gene is unknown or an input
+    is null.
     organism: human or mouse
-    }
     """
     return register_plugin_function(
         args=[junction, v_call, j_call],
