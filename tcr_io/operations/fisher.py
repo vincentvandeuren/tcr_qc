@@ -69,7 +69,7 @@ class FisherTest:
 @dataclass
 class FisherAssociation(BaseOperation):
     name = "fisher_association"
-    version = "0.1"
+    version = "0.2"
     description = "Emerson associated-TCR test: per-clonotype Fisher-exact association of clone presence with a binary phenotype label."
     supported_loci = KNOWN_LOCI
 
@@ -77,7 +77,7 @@ class FisherAssociation(BaseOperation):
     # the number of outputs is only known once the op is constructed, so it cannot be a fixed
     # set of class attributes. The runner records what was written rather than what was
     # declared, so zero tests is a legal (empty) result rather than a missing output.
-    association = Artifact("{test}.parquet", Format.PARQUET)
+    association_results = Artifact("{test}.parquet", Format.PARQUET)
 
     tests: Optional[List[FisherTest]] = None        # set in __post_init__ (mutable default guard)
     grain: Literal["patient", "repertoire"] = "patient"
