@@ -15,11 +15,12 @@ fn reference_points_struct_output(_input_fields: &[Field]) -> PolarsResult<Field
             Field::new("d_begin_trimmed".into(), DataType::UInt32),
             Field::new("d_end_trimmed".into(), DataType::UInt32),
             Field::new("j_begin_trimmed".into(), DataType::UInt32),
-            Field::new("v_end".into(), DataType::UInt32),
-            Field::new("d_begin".into(), DataType::UInt32),
-            Field::new("d_end".into(), DataType::UInt32),
-            Field::new("j_begin".into(), DataType::UInt32),
+            Field::new("v_end".into(), DataType::Int32),
+            Field::new("d_begin".into(), DataType::Int32),
+            Field::new("d_end".into(), DataType::Int32),
+            Field::new("j_begin".into(), DataType::Int32),
             Field::new("cdr3_end".into(), DataType::UInt32),
+            Field::new("d_call".into(), DataType::String),
         ]),
     ))
 }
@@ -46,55 +47,33 @@ pub fn determine_reference_points_polars(
     let mut col_d_begin_trimmed: Vec<Option<u32>> = Vec::with_capacity(len);
     let mut col_d_end_trimmed: Vec<Option<u32>> = Vec::with_capacity(len);
     let mut col_j_begin_trimmed: Vec<Option<u32>> = Vec::with_capacity(len);
-    let mut col_v_end: Vec<Option<u32>> = Vec::with_capacity(len);
-    let mut col_d_begin: Vec<Option<u32>> = Vec::with_capacity(len);
-    let mut col_d_end: Vec<Option<u32>> = Vec::with_capacity(len);
-    let mut col_j_begin: Vec<Option<u32>> = Vec::with_capacity(len);
+    let mut col_v_end: Vec<Option<i32>> = Vec::with_capacity(len);
+    let mut col_d_begin: Vec<Option<i32>> = Vec::with_capacity(len);
+    let mut col_d_end: Vec<Option<i32>> = Vec::with_capacity(len);
+    let mut col_j_begin: Vec<Option<i32>> = Vec::with_capacity(len);
     let mut col_cdr3_end: Vec<Option<u32>> = Vec::with_capacity(len);
+    let mut col_d_call: Vec<Option<&str>> = Vec::with_capacity(len);
 
     for ((opt_junction, opt_v_call), opt_j_call) in ca_junction
         .into_iter()
         .zip(ca_v_call.into_iter())
         .zip(ca_j_call.into_iter())
     {
-        match (opt_junction, opt_v_call, opt_j_call) {
-            (Some(junction), Some(v_call), Some(j_call)) => {
-                if let Some(rp) = determine_reference_points(species, junction, v_call, j_call) {
-                    col_v_end_trimmed.push(Some(rp.v_end_trimmed as u32));
-                    col_d_begin_trimmed.push(Some(rp.d_begin_trimmed as u32));
-                    col_d_end_trimmed.push(Some(rp.d_end_trimmed as u32));
-                    col_j_begin_trimmed.push(Some(rp.j_begin_trimmed as u32));
-                    col_v_end.push(Some(rp.v_end as u32));
-                    col_d_begin.push(Some(rp.d_begin as u32));
-                    col_d_end.push(Some(rp.d_end as u32));
-                    col_j_begin.push(Some(rp.j_begin as u32));
-                    col_cdr3_end.push(Some(rp.cdr3_end as u32));
-                } else {
-                    // determine_reference_points returned None
-                    col_v_end_trimmed.push(None);
-                    col_d_begin_trimmed.push(None);
-                    col_d_end_trimmed.push(None);
-                    col_j_begin_trimmed.push(None);
-                    col_v_end.push(None);
-                    col_d_begin.push(None);
-                    col_d_end.push(None);
-                    col_j_begin.push(None);
-                    col_cdr3_end.push(None);
-                }
-            }
-            _ => {
-                // Any input is null → propagate nulls
-                col_v_end_trimmed.push(None);
-                col_d_begin_trimmed.push(None);
-                col_d_end_trimmed.push(None);
-                col_j_begin_trimmed.push(None);
-                col_v_end.push(None);
-                col_d_begin.push(None);
-                col_d_end.push(None);
-                col_j_begin.push(None);
-                col_cdr3_end.push(None);
-            }
-        }
+        // Any input null, or determine_reference_points returning None → all fields null
+        let rp = match (opt_junction, opt_v_call, opt_j_call) {
+            (Some(junction), Some(v_call), Some(j_call)) => determine_reference_points(species, junction, v_call, j_call),
+            _ => None,
+        };
+        col_v_end_trimmed.push(rp.as_ref().map(|rp| rp.v_end_trimmed as u32));
+        col_d_begin_trimmed.push(rp.as_ref().and_then(|rp| rp.d_begin_trimmed).map(|x| x as u32));
+        col_d_end_trimmed.push(rp.as_ref().and_then(|rp| rp.d_end_trimmed).map(|x| x as u32));
+        col_j_begin_trimmed.push(rp.as_ref().map(|rp| rp.j_begin_trimmed as u32));
+        col_v_end.push(rp.as_ref().map(|rp| rp.v_end as i32));
+        col_d_begin.push(rp.as_ref().and_then(|rp| rp.d_begin).map(|x| x as i32));
+        col_d_end.push(rp.as_ref().and_then(|rp| rp.d_end).map(|x| x as i32));
+        col_j_begin.push(rp.as_ref().map(|rp| rp.j_begin as i32));
+        col_cdr3_end.push(rp.as_ref().map(|rp| rp.cdr3_end as u32));
+        col_d_call.push(rp.as_ref().and_then(|rp| rp.d_call));
     }
 
     let s_v_end_trimmed = Series::new("v_end_trimmed".into(), col_v_end_trimmed);
@@ -106,6 +85,7 @@ pub fn determine_reference_points_polars(
     let s_d_end = Series::new("d_end".into(), col_d_end);
     let s_j_begin = Series::new("j_begin".into(), col_j_begin);
     let s_cdr3_end = Series::new("cdr3_end".into(), col_cdr3_end);
+    let s_d_call = Series::new("d_call".into(), col_d_call);
 
     let fields = vec![
         s_v_end_trimmed,
@@ -117,6 +97,7 @@ pub fn determine_reference_points_polars(
         s_d_end,
         s_j_begin,
         s_cdr3_end,
+        s_d_call,
     ];
 
     StructChunked::from_series("reference_points".into(), len, fields.iter())
