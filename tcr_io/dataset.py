@@ -181,24 +181,32 @@ class Dataset:
         """Re-run an operation from its recorded config, with overrides. Forced."""
         return OperationRunner(self).rebuild(op_cls, **overrides)
 
-    def result(self, art: Artifact, *, locus: Optional[str] = None, **params) -> Handle:
-        """A handle on one operation output.
+    def get_result(
+            self, 
+            art: Artifact | BaseOperation | type[BaseOperation], 
+            *, 
+            locus: Optional[str] = None, 
+            **params
+            ) -> Handle:
+        """Read an artifact. When provided an operation, use first directly declared (not inherited) output artifact."""
 
-        The artifact is the operation's own class attribute, so the call names both at once
-        and a typo is an AttributeError:
-
-            ds.result(DiversityReport.diversity_summary, locus="TRB").read()
-
-        The output directory comes from `art.owner.name` — which is why `BaseOperation.
-        artifacts()` refuses an inherited artifact. `locus` defaults to the bound one, so on
-        `ds.select_locus("TRB")` it can be left off entirely."""
+        def _get_first_artifact(cls: type[BaseOperation]) -> Artifact:
+            for value in vars(cls).values():
+                if isinstance(value, Artifact):
+                    return value
+            raise LookupError(f"{cls.__name__} has no declared Artifact outputs.")
+                
         locus = locus if locus is not None else self._locus("result")
+
+
+        if isinstance(art, BaseOperation):
+            art = _get_first_artifact(type(art))
+        elif isinstance(art, type) and issubclass(art, BaseOperation):
+            art = _get_first_artifact(art)
+
         if not isinstance(art, Artifact):
-            raise TypeError(
-                f"result() takes an operation's Artifact, not {art!r}. Import the operations "
-                f"namespace and name the output — `from tcr_io import operations as op` then "
-                f"`ds.result(op.FilteringReport.filter_summary)`, which autocompletes and casts. "
-                f"To read by name instead, use raw_result(op_name, output).")
+            raise TypeError(f"result() expects an Artifact, got {type(art)}.")
+
         if art.owner is None:
             raise ValueError(f"{art!r} is not declared on an operation class; use raw_result().")
         return self._op_store(art.owner.name, locus)(art, **params)
