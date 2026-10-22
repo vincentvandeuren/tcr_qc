@@ -23,7 +23,8 @@ def import_bazairr():
 class ConstructBazairrIndex(BaseOperation):
     name = "construct_bazairr_index"
     version = "2.0"
-    description = "One .bazairr CDR3 similarity index per V gene of the passing clonotypes."
+    description = "One .bazairr CDR3 similarity index per V gene of the passing clonotypes (TRB only)."
+    supported_loci = frozenset({"TRB"})
 
     index = Artifact("index", Format.BAZAIRR_DIR)
 
