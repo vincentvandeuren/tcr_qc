@@ -89,13 +89,15 @@ class Format(Enum):
     `PARQUET_DIR` is a directory: `ext` is `""` and it has `scan` only. `read` and `write`
     are `None`, and reaching for them raises TypeError — a directory is sunk into and
     scanned back, never round-tripped through one frame. A `None` slot is a stated
-    capability, not a gap.
+    capability, not a gap. `BAZAIRR_DIR` is a directory of files polars does not read (an
+    index), so it has none of the three.
     """
     #             ext          read           write           scan
     PARQUET     = (".parquet", _read_parquet, _write_parquet, pl.scan_parquet)
     NDJSON      = (".ndjson",  _read_ndjson,  _write_ndjson,  None)
     JSON        = (".json",    _read_json,    _write_json,    None)
     PARQUET_DIR = ("",         None,          None,           pl.scan_parquet)
+    BAZAIRR_DIR   = ("",         None,          None,           None)
 
     def __init__(self, ext: str, read: Optional[Callable], write: Optional[Callable],
                  scan: Optional[Callable]):
@@ -104,7 +106,7 @@ class Format(Enum):
     @property
     def is_dir(self) -> bool:
         """Named, because two checks branch on it and `ext == ""` reads like a coincidence."""
-        return self is Format.PARQUET_DIR
+        return self in (Format.PARQUET_DIR, Format.BAZAIRR_DIR)
 
 
 class OnMissing(Enum):

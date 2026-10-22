@@ -1,4 +1,4 @@
-from polars import DataFrame
+from polars import DataFrame, Series
 
 __version__: str
 

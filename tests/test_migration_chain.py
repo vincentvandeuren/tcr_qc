@@ -163,3 +163,23 @@ def test_migrating_twice_is_a_no_op(v3_tree):
     assert sorted(str(p.relative_to(v3_tree)) for p in v3_tree.rglob("*") if p.is_file()) == before
     assert pl.read_parquet(v3_tree / "processed_repertoires/locus=TRB/rep1.parquet") \
              ["filter_reason"].to_list() == [None, None, "unknown"]
+
+
+def test_v8_removes_tabulation_dir(tmp_path):
+    """A v7 tree holding the retired tabulation migrates to v8 with that directory gone and
+    the other operations' results untouched."""
+    db = tmp_path / "db"
+    tab = db / "operations/tabulate_by_vj_gene/TRB/tabulated"
+    tab.mkdir(parents=True)
+    (tab / "part.parquet").write_bytes(b"")
+    keep = db / "operations/diversity_report/TRB/operation.json"
+    keep.parent.mkdir(parents=True)
+    keep.write_text("{}")
+    (db / "meta").mkdir()
+    (db / "meta/manifest.json").write_text(json.dumps({"version": 7}))
+
+    from tcr_io.structure.migrations import REGISTRY
+    REGISTRY[8].fn(db)
+
+    assert not (db / "operations/tabulate_by_vj_gene").exists()
+    assert keep.exists()

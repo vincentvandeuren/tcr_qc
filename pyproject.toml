@@ -42,6 +42,10 @@ dev = ["maturin>=1.14", "ruff>=0.15", "pytest>=9.1", "mypy>=2.1"]
 [project.urls]
 Repository = "https://github.com/vincentvandeuren/tcr_qc"
 
+[tool.pytest.ini_options]
+markers = ["realdb: reads /data/current/tcrio_db (and indexes souza_2019, shi_2017, fenninger_2023 in place); run with -m realdb"]
+addopts = "-m 'not realdb'"
+
 [tool.maturin]
 module-name = "tcr_io._internal"
 include = ["tcr_io/resources/*.parquet"]

@@ -16,7 +16,7 @@ from tcr_io.structure import (
 )
 import tcr_io.structure.schema as S
 from tcr_io.operations import (
-    NullOperation, DiversityReport, GeneCountsSummary, TabulateByVJ, RarefactionReport,
+    DiversityReport, GeneCountsSummary, RarefactionReport,
 )
 from tcr_io.operations.base import BaseOperation
 
@@ -84,8 +84,16 @@ def test_locus_aware_writes_under_a_locus_subdir(ds):
     assert (ds.db_dir / "operations/diversity_report/TRB/diversity_summary.parquet").exists()
 
 
+@dataclass
+class _NullOperation(BaseOperation):
+    name, version, description = "null_operation", "0.1", "writes nothing"
+
+    def _run(self, ds, out):
+        pass
+
+
 def test_one_record_per_locus(ds):
-    ds.run_operation(NullOperation())
+    ds.run_operation(_NullOperation())
     ds.run_operation(DiversityReport())
     assert {(r.operation_name, r.locus) for r in ds.operations} == {
         ("null_operation", "TRB"), ("diversity_report", "TRB")}
@@ -95,15 +103,15 @@ def test_one_record_per_locus(ds):
 
 def test_result_reads_back_by_artifact(ds):
     ds.run_operation(DiversityReport())
-    a = ds.result(DiversityReport.diversity_summary, locus="TRB").read()
-    b = ds.select_locus("TRB").result(DiversityReport.diversity_summary).read()   # bound locus
+    a = ds.get_result(DiversityReport.diversity_summary, locus="TRB").read()
+    b = ds.select_locus("TRB").get_result(DiversityReport.diversity_summary).read()   # bound locus
     assert a.equals(b) and "repertoire_id" in a.columns
 
 
 def test_raw_result_reads_back_by_name(ds):
     ds.run_operation(DiversityReport())
     by_name = ds.raw_result("diversity_report", "diversity_summary", locus="TRB").read()
-    assert by_name.equals(ds.result(DiversityReport.diversity_summary, locus="TRB").read())
+    assert by_name.equals(ds.get_result(DiversityReport.diversity_summary, locus="TRB").read())
 
 
 def test_raw_result_miss_lists_available(ds):
@@ -227,29 +235,6 @@ def test_an_inherited_output_is_refused():
 
     with pytest.raises(TypeError, match="inherits output"):
         _Sub.artifacts()
-# --- directory outputs ------------------------------------------------------------------
-
-def test_tabulate_writes_a_scannable_directory(ds):
-    ds.run_operation(TabulateByVJ())
-    rec = ds._record("tabulate_by_vj_gene", "TRB")
-    o = rec.outputs[0]
-    assert o.name == "tabulated" and o.format == "PARQUET_DIR" and o.template == "tabulated"
-
-    handle = ds.result(TabulateByVJ.tabulated, locus="TRB")
-    assert handle.path().is_dir()
-    names = handle.scan().collect_schema().names()               # no read(); scan only
-    assert {"v_gene", "j_gene"} <= set(names)
-
-
-def test_rerunning_a_directory_output_clears_stale_partitions(ds):
-    ds.run_operation(TabulateByVJ())
-    tab = ds.result(TabulateByVJ.tabulated, locus="TRB").path()
-    (tab / "stale.txt").write_text("STALE")
-    ds.rerun(TabulateByVJ)
-    assert not (tab / "stale.txt").exists()
-    assert any(tab.iterdir())
-
-
 # --- fan-out ----------------------------------------------------------------------------
 
 def test_a_bound_dataset_fans_out_over_its_locus_alone(ds):
@@ -292,7 +277,7 @@ def test_rarefaction_report(ds):
     rec = ds._record("rarefaction_report", "TRB")
     assert rec.params == {"num_points": 30, "max_depth": 1000, "extrapolation": True}
     assert [o.name for o in rec.outputs] == ["rarefaction_curves"]
-    df = ds.result(RarefactionReport.rarefaction_curves, locus="TRB").read()
+    df = ds.get_result(RarefactionReport.rarefaction_curves, locus="TRB").read()
     assert {"subsampling_depth", "expected_richness", "type", "repertoire_id"} <= set(df.columns)
     assert set(df["repertoire_id"].unique().to_list()) == {"rep_a", "rep_b"}
 
@@ -344,10 +329,10 @@ def test_filtering_report_unassigned_summary(ds):
     ds.run_operation(FilteringReport())
     # Assignment failures live under the `_unassigned` pseudo-locus, same shape as a quality
     # report: a wide first-failure summary + per-reason top tables + totals.
-    summ = ds.result(FilteringReport.filter_summary, locus="_unassigned").read()
+    summ = ds.get_result(FilteringReport.filter_summary, locus="_unassigned").read()
     row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
     assert (row["null_v"], row["null_j"]) == (1, 1)
-    totals = ds.result(FilteringReport.filter_reason_totals, locus="_unassigned").read()
+    totals = ds.get_result(FilteringReport.filter_reason_totals, locus="_unassigned").read()
     t = dict(zip(totals["reason"].to_list(), totals["n_failed_rows"].to_list()))
     assert t["null_v"] == 1 and t["null_j"] == 1
 
@@ -375,16 +360,16 @@ def test_filtering_report_quality_population(ds):
 
     ds.run_operation(FilteringReport())
 
-    summ = ds.result(FilteringReport.filter_summary, locus="TRB").read()
+    summ = ds.get_result(FilteringReport.filter_summary, locus="TRB").read()
     row = summ.filter(pl.col("repertoire_id") == "rep_a").to_dicts()[0]
     assert row["invalid_junction_aa"] == 1
     assert row["invalid_v_call"] == 1
     assert row["null_junction"] == 1
 
-    top_aa = ds.result(FilteringReport.filter_top, locus="TRB",
+    top_aa = ds.get_result(FilteringReport.filter_top, locus="TRB",
                        reason="invalid_junction_aa").read()
     assert top_aa.filter(pl.col("junction_aa") == "XXX")["count"].to_list() == [1]
-    top_v = ds.result(FilteringReport.filter_top, locus="TRB", reason="invalid_v_call").read()
+    top_v = ds.get_result(FilteringReport.filter_top, locus="TRB", reason="invalid_v_call").read()
     assert top_v.filter(pl.col("v_call") == "TRBV999*01")["count"].to_list() == [1]
 
     # A reason that never fired gets NO table. v0.5 emitted an empty one, because it rebuilt
@@ -392,10 +377,10 @@ def test_filtering_report_quality_population(ds):
     # the stored `filter_reason`, which only names the ones that did. The runner allows it —
     # `_observe` exempts parameterised artifacts, since "no filter reason fired" is a
     # legitimate zero — and the legend below still says which reasons the locus saw.
-    assert not ds.result(FilteringReport.filter_top, locus="TRB",
+    assert not ds.get_result(FilteringReport.filter_top, locus="TRB",
                          reason="invalid_j_call").exists()
 
-    legend = ds.result(FilteringReport.filter_legend, locus="TRB").read()
+    legend = ds.get_result(FilteringReport.filter_legend, locus="TRB").read()
     assert {"reason", "description", "group_col"} <= set(legend.columns)
     assert "imgt_functional" not in legend["reason"].to_list()   # expanded into sub-reasons
     assert "invalid_v_call" in legend["reason"].to_list()

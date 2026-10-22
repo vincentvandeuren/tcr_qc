@@ -11,7 +11,8 @@ from dataclasses import dataclass, asdict, fields
 from .layout import MANIFEST
 from .store import Store
 
-DATASET_VERSION = 7   # v7: the ingest record moves to `meta/generation.json` (a JSON object, not a
+DATASET_VERSION = 8   # v8: the TabulateByVJ results are dropped (the CDR3 index replaces them).
+                      # v7: the ingest record moves to `meta/generation.json` (a JSON object, not a
                       #     one-row NDJSON table) and absorbs `tcrio_version` and `filters` from the
                       #     manifest — one record answering "how was this dataset made". The manifest
                       #     is left holding `version` alone.

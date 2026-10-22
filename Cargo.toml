@@ -8,7 +8,7 @@ name = "tcr_io"
 crate-type= ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.0", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.27.0", features = ["abi3-py310"] }
 pyo3-polars = { version = "0.26.0", features = ["derive", "dtype-struct", "dtype-array"] }
 serde = { version = "1", features = ["derive"] }
 polars = { version = "0.53.0", features=["dtype-struct"], default-features = false}
@@ -18,3 +18,17 @@ aho-corasick = "1.1.4"
 rayon = "1"
 # Symmetric-deletion similarity search; core crate is pyo3-free and shares our rayon pool.
 symscan = "0.8"
+
+[features]
+# `extension-module` tells pyo3 to leave libpython unlinked: the interpreter that dlopen()s the wheel's .so already
+# provides those symbols, and linking them would pin the extension to one interpreter build. It is on by default, so
+# every ordinary build and every maturin wheel gets it. A `cargo test` harness, though, is a plain executable that has
+# to link and start an interpreter itself, so the Rust tests run with `--no-default-features` (with the
+# `auto-initialize` dev-dependency below starting the interpreter on the first `Python::attach`):
+#     cargo test --no-default-features index::
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dev-dependencies]
+pyo3 = { version = "0.27.0", features = ["auto-initialize"] }
+

@@ -312,6 +312,14 @@ class Dataset:
         return MetadataWriter(self)
 
     @cached_property
+    def query(self) -> "DatasetQuery":
+        """The CDR3 similarity search over this dataset's index (`ConstructBazairrIndex`):
+        `ds.query.hamming(q, 2, by="patient_id")`. Several datasets: `DatasetQuery([...])`. Cached,
+        so the index partitions a query loads stay loaded for later calls."""
+        from .operations.construct_bazairr_index import import_bazairr
+        return import_bazairr().DatasetQuery(self)
+
+    @cached_property
     def publication_meta(self) -> dict:
         return self.store(layout.PUBLICATION_IDS).read().to_dict(as_series=False)
 

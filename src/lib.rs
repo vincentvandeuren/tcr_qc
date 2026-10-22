@@ -3,7 +3,6 @@ mod d_segment;
 mod reference_points;
 mod junction_trimmer;
 mod genes_imgt;
-mod franken;
 mod neighbors;
 
 use polars::prelude::*;
@@ -24,7 +23,6 @@ fn _internal(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(times_two_function, m)?)?;
     m.add_function(wrap_pyfunction!(count_matches_function, m)?)?;
-    m.add_function(wrap_pyfunction!(franken::franken_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(neighbors::hd1_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(neighbors::neighbor_counts, m)?)?;
     Ok(())
