@@ -19,7 +19,11 @@ def mappers_from_file(file:Path):
 
     Returns two DictMappers, one for repertoire_id and one for patient_id.
     """
+    if not file.exists():
+        raise FileNotFoundError(f"Mapping file {file} does not exist")
+    
     df = pl.read_csv(file, has_header=True, separator=",")
+    
     if "filename" not in df.columns or "repertoire_id" not in df.columns or "patient_id" not in df.columns:
         raise ValueError(f"The mapping file must have columns 'filename', 'repertoire_id', and 'patient_id', receieved: " + ", ".join(df.columns))
 
