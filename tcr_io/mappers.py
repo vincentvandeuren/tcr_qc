@@ -5,6 +5,29 @@ from typing import Dict, List, Union
 import re
 from collections import defaultdict
 from natsort import natsorted
+import polars as pl
+
+
+def mappers_from_file(file:Path):
+    """
+    Load a mapping from a file. The file should be a CSV with three columns:
+    - filename: the name of the file
+    - repertoire_id: the repertoire ID this file belongs to
+    - patient_id: the patient ID this file belongs to
+
+    The column names should be included in the first row of the file.
+
+    Returns two DictMappers, one for repertoire_id and one for patient_id.
+    """
+    df = pl.read_csv(file, has_header=True, separator=",")
+    if "filename" not in df.columns or "repertoire_id" not in df.columns or "patient_id" not in df.columns:
+        raise ValueError(f"The mapping file must have columns 'filename', 'repertoire_id', and 'patient_id', receieved: " + ", ".join(df.columns))
+
+    filename_to_repertoire = dict(zip(df["filename"], df["repertoire_id"]))
+    filename_to_patient = dict(zip(df["filename"], df["patient_id"]))
+
+    return DictMapper(filename_to_repertoire), DictMapper(filename_to_patient)
+
 
 class BaseMapper():
     def transform(self, key:Union[List[Path], Path]):
