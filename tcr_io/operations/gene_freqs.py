@@ -1,27 +1,52 @@
 # copy code from baseline technical features model
 from .base import BaseOperation
 from ..structure import Artifact, Format, Store
-from ..expressions import extract_genes
+from ..expressions import extract_genes, KNOWN_LOCI
 from dataclasses import dataclass
 import polars as pl
 from itertools import product
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..dataset import Dataset
 
-V_GENES = ['TRBV2', 'TRBV3-1', 'TRBV4-1', 'TRBV4-2', 'TRBV4-3', 'TRBV5-1', 'TRBV5-4', 'TRBV5-5', 'TRBV5-6', 'TRBV5-8', 'TRBV6-1', 'TRBV6-3', 'TRBV6-4', 'TRBV6-5', 'TRBV6-6', 'TRBV6-8', 'TRBV6-9', 'TRBV7-2', 'TRBV7-3', 'TRBV7-4', 'TRBV7-6', 'TRBV7-7', 'TRBV7-8', 'TRBV7-9', 'TRBV9', 'TRBV10-2', 'TRBV10-3', 'TRBV11-1', 'TRBV11-2', 'TRBV11-3', 'TRBV12-3', 'TRBV12-4', 'TRBV12-5', 'TRBV13', 'TRBV14', 'TRBV15', 'TRBV16', 'TRBV18', 'TRBV19', 'TRBV20-1', 'TRBV24-1', 'TRBV25-1', 'TRBV27', 'TRBV28', 'TRBV29-1', 'TRBV30']
-J_GENES = ['TRBJ1-1', 'TRBJ1-2', 'TRBJ1-3', 'TRBJ1-4', 'TRBJ1-5', 'TRBJ1-6', 'TRBJ2-1', 'TRBJ2-2', 'TRBJ2-3', 'TRBJ2-4', 'TRBJ2-5', 'TRBJ2-6', 'TRBJ2-7']
-VJ_COLS = [f"{v}+{j}" for v, j in product(V_GENES, J_GENES)]
+# for TRB - use fixed genes (for cross-dataset comparibility)
+TRB_V_GENES = ['TRBV2', 'TRBV3-1', 'TRBV4-1', 'TRBV4-2', 'TRBV4-3', 'TRBV5-1', 'TRBV5-4', 'TRBV5-5', 'TRBV5-6', 'TRBV5-8', 'TRBV6-1', 'TRBV6-2', 'TRBV6-3', 'TRBV6-4', 'TRBV6-5', 'TRBV6-6', 'TRBV6-8', 'TRBV6-9', 'TRBV7-2', 'TRBV7-3', 'TRBV7-4', 'TRBV7-6', 'TRBV7-7', 'TRBV7-8', 'TRBV7-9', 'TRBV9', 'TRBV10-2', 'TRBV10-3', 'TRBV11-1', 'TRBV11-2', 'TRBV11-3', 'TRBV12-3', 'TRBV12-4', 'TRBV12-5', 'TRBV13', 'TRBV14', 'TRBV15', 'TRBV16', 'TRBV18', 'TRBV19', 'TRBV20-1', 'TRBV24-1', 'TRBV25-1', 'TRBV27', 'TRBV28', 'TRBV29-1', 'TRBV30']
+TRB_J_GENES = ['TRBJ1-1', 'TRBJ1-2', 'TRBJ1-3', 'TRBJ1-4', 'TRBJ1-5', 'TRBJ1-6', 'TRBJ2-1', 'TRBJ2-2', 'TRBJ2-3', 'TRBJ2-4', 'TRBJ2-5', 'TRBJ2-6', 'TRBJ2-7']
 
+
+def _get_v_j_genes(ds: "Dataset"):
+    """
+    Extract the list of V/J genes and their combinations from the given dataset.
+    For TRB, use the fixed gene lists for cross-dataset comparability.
+    """
+    if ds.locus == "TRB":
+        v_genes = TRB_V_GENES
+        j_genes = TRB_J_GENES
+
+    else:
+        v_alleles = ds.clonotypes.select(pl.col("v_call").unique()).with_columns(
+            pl.col("v_call").str.extract(r"(.*)\*\d{2}").alias("v_gene")
+        ).collect()
+        j_alleles = ds.clonotypes.select(pl.col("j_call").unique()).with_columns(
+            pl.col("j_call").str.extract(r"(.*)\*\d{2}").alias("j_gene")
+        ).collect()
+
+        v_genes = v_alleles.select(pl.col("v_gene").unique()).sort("v_gene").to_numpy().flatten().tolist()
+        j_genes = j_alleles.select(pl.col("j_gene").unique()).sort("j_gene").to_numpy().flatten().tolist()
+    
+    vj_genes = [f"{v}+{j}" for v, j in product(v_genes, j_genes)]
+    return v_genes, j_genes, vj_genes
 
 
 @dataclass
 class GeneCountsSummary(BaseOperation):
     name = "gene_counts_summary"
-    version = "0.3"
+    version = "0.5"
+    # version = "0.4" -> added other loci
+    # version = "0.3" -> added TRB6-2
     description = "Counts the V and J gene usage frequencies, and computes the surprise of their combinations."
-    # TRB-only for now: the gene columns are hardcoded TRBV/TRBJ (for cross-repertoire
-    # comparability + missing-gene highlighting). The per-locus functional-gene rewrite lands
-    # in Phase 2, at which point this widens back to KNOWN_LOCI. See tr_bcr_chain_support plan §2.3.
-    supported_loci = frozenset({"TRB"})
+    supported_loci = KNOWN_LOCI
 
     gene_counts = Artifact("gene_counts.parquet", Format.PARQUET)
     v_counts    = Artifact("v_counts.parquet", Format.PARQUET)
@@ -30,7 +55,8 @@ class GeneCountsSummary(BaseOperation):
     vj_long     = Artifact("vj_long.parquet", Format.PARQUET)
 
     def _run(self, ds, out: Store) -> None:
-        
+
+        V, J, VJ = _get_v_j_genes(ds)
         vj_table = []
 
         for repertoire_id, df in ds.iter_repertoires(progress_bar = True, progress_desc="Counting v/j statistics"):
@@ -42,7 +68,7 @@ class GeneCountsSummary(BaseOperation):
             vj_table.append(vj)
 
         vj_table = pl.concat(vj_table).filter(
-            pl.col("v_gene").is_in(V_GENES) & pl.col("j_gene").is_in(J_GENES)
+            pl.col("v_gene").is_in(V) & pl.col("j_gene").is_in(J)
         )
 
         totals = vj_table.group_by("repertoire_id").agg(pl.sum("count").alias("repertoire_total"))
@@ -77,21 +103,21 @@ class GeneCountsSummary(BaseOperation):
         v_tab = v_long.pivot(
             index="repertoire_id",
             on="v_gene",
-            on_columns = V_GENES,
+            on_columns = V,
             values="frequency",
         ).fill_null(0)
 
         j_tab = j_long.pivot(
             index="repertoire_id",
             on="j_gene",
-            on_columns = J_GENES,
+            on_columns = J,
             values="frequency",
         ).fill_null(0) 
 
         vj_surprise_tab = vj_long.pivot(
             index="repertoire_id",
             on="vj_comb",
-            on_columns = VJ_COLS,
+            on_columns = VJ,
             values="vj_bias",
         ).select(
             pl.col("repertoire_id"),
